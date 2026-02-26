@@ -5,7 +5,7 @@
         ./builtins/string ./builtins/math ./builtins/io
         :std/getopt :std/format :std/srfi/13
         :gerbil-pcre/pcre2/pcre2)
-(export main)
+(export main run-awk)
 
 ;; Buffer for multi-char RS record splitting
 (def *record-buffer* '())

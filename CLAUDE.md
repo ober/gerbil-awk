@@ -8,6 +8,10 @@ AWK interpreter written in Gerbil Scheme, targeting GNU awk (gawk) compatibility
 - Build: `make build` (handles gerbil-pcre dependency setup automatically)
 - Clean build: `make clean && make build`
 - Install: `make install` (copies to `/usr/local/bin/`)
+- Library: `make lib` (compile modules without linking exe, for embedding in other projects)
+- Install lib: `make install-lib` (links package so others can `(import :gerbil-awk/awk/lib)`)
+- Uninstall lib: `make uninstall-lib`
+- Static binary: `make static` (Docker + Alpine/musl, produces fully static gerbawk)
 - Dependency: requires `gerbil-pcre` package installed globally (`gerbil pkg install github.com/ober/gerbil-pcre2`)
 
 ## MANDATORY: Verify Build Before Commit/Push
@@ -48,8 +52,9 @@ Hash iteration order may differ between gawk and gerbawk for `for (k in array)` 
 - `awk/builtins/string.ss` — String builtins (sub, gsub, split, sprintf, etc.)
 - `awk/builtins/math.ss` — Math builtins (sin, cos, sqrt, rand, etc.)
 - `awk/builtins/io.ss` — I/O builtins (system, close, fflush)
+- `awk/lib.ss` — Library entry point for embedding (re-exports public API)
 - `awk/fields.ss` — Re-exports runtime
-- `build.ss` — Build script with pcre2 linker flags
+- `build.ss` — Build script (supports GERBAWK_LIB_ONLY=1 and GERBAWK_STATIC=1)
 - `gerbil.pkg` — Package config, depends on gerbil-pcre
 
 ## Key Implementation Notes
