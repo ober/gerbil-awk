@@ -645,7 +645,7 @@
                         (or (awk-signal-return-value e) (make-awk-uninit))))))
                (env-pop-locals! env)
                result))
-           (error (string-append "awk: unknown function: " (symbol->string name)))))))))
+           (error (string-append "gerbawk: unknown function: " (symbol->string name)))))))))
 
 ;;; Getline
 

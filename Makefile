@@ -1,5 +1,5 @@
 GERBIL := gerbil
-GAWK_BIN := gawk
+GAWK_BIN := gerbawk
 
 .PHONY: all build clean test install
 

@@ -331,7 +331,7 @@
         (nb (awk->number b)))
     (if (zero? nb)
       (begin
-        (display "gawk: error: division by zero attempted\n" (current-error-port))
+        (display "gerbawk: error: division by zero attempted\n" (current-error-port))
         (exit 2))
       (make-awk-number (/ na nb)))))
 (def (awk-mod a b)
@@ -339,7 +339,7 @@
         (nb (awk->number b)))
     (if (zero? nb)
       (begin
-        (display "gawk: error: division by zero attempted\n" (current-error-port))
+        (display "gerbawk: error: division by zero attempted\n" (current-error-port))
         (exit 2))
       (make-awk-number (- na (* (truncate (/ na nb)) nb))))))
 (def (awk-pow a b)

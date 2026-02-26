@@ -14,7 +14,7 @@
     "awk/builtins/string"
     "awk/builtins/math"
     "awk/builtins/io"
-    (exe: "awk/main" bin: "gawk"
+    (exe: "awk/main" bin: "gerbawk"
           "-cc-options" ,(cppflags "libpcre2-8" "")
           "-ld-options" ,(ldflags "libpcre2-8" "-lpcre2-8")))
   libdir: (path-normalize (path-directory (this-source-file))))
