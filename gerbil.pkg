@@ -1,2 +1,2 @@
 (package: gerbil-awk
- depend: ("gerbil-pcre"))
+ depend: ("github.com/ober/gerbil-pcre2"))
