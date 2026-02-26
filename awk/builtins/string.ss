@@ -42,6 +42,7 @@
                (env-get-str env 'FS)))
          (parts (cond
                   ((string=? fs " ") (split-on-whitespace str))
+                  ((string=? fs "") (map string (string->list str)))
                   ((= (string-length fs) 1) (split-on-char str (string-ref fs 0)))
                   (else (pcre2-split fs str))))
          (arr (env-get-array env arr-name)))
@@ -344,7 +345,9 @@
     "0"
     (let* ((abs-n (abs n))
            (exp (if (zero? abs-n) 0
-                    (inexact->exact (floor (/ (log abs-n) (log 10)))))))
+                    (inexact->exact (floor (/ (log abs-n) (log 10))))))
+           ;; Correct for floating-point imprecision
+           (exp (if (>= abs-n (expt 10.0 (+ exp 1))) (+ exp 1) exp)))
       (if (and (>= exp -4) (< exp prec))
         ;; Use %f style, then strip trailing zeros
         (let ((s (format-float-f n (- prec exp 1))))

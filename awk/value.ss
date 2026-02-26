@@ -85,24 +85,37 @@
 
 ;;; C-style format for a single float
 (def (c-format fmt n)
-  "Minimal C-style printf for %.Ng format (used by OFMT/CONVFMT)"
-  ;; Parse precision from format like "%.6g"
-  (let ((prec (parse-g-precision fmt)))
-    (format-g-number n prec)))
+  "C-style printf for OFMT/CONVFMT (e.g., %.6g, %.2f)"
+  ;; Detect format type from last char
+  (let* ((len (string-length fmt))
+         (spec (if (> len 0) (string-ref fmt (- len 1)) #\g)))
+    (case spec
+      ((#\g #\G)
+       (let ((prec (max 1 (parse-format-precision fmt))))
+         (format-g-number n prec)))
+      ((#\f)
+       (let ((prec (parse-format-precision fmt)))
+         (format-f-number n prec)))
+      ((#\e #\E)
+       (let ((prec (parse-format-precision fmt)))
+         (format-e-number n prec (char=? spec #\E))))
+      (else
+       (let ((prec (max 1 (parse-format-precision fmt))))
+         (format-g-number n prec))))))
 
-(def (parse-g-precision fmt)
-  "Extract precision from %.Ng format string, default 6"
+(def (parse-format-precision fmt)
+  "Extract precision from %.N format string, default 6"
   (let ((len (string-length fmt)))
     (if (and (>= len 3)
              (char=? (string-ref fmt 0) #\%)
              (char=? (string-ref fmt 1) #\.))
       (let loop ((i 2) (n 0))
         (if (>= i len)
-          (max n 1)
+          n
           (let ((c (string-ref fmt i)))
             (if (char-numeric? c)
               (loop (+ i 1) (+ (* n 10) (- (char->integer c) (char->integer #\0))))
-              (max n 1)))))
+              n))))
       6)))
 
 (def (format-g-number n prec)
@@ -112,6 +125,45 @@
     ((nan? n) "nan")
     ((infinite? n) (if (positive? n) "inf" "-inf"))
     (else (format-g-nonzero n prec))))
+
+(def (format-f-number n prec)
+  "Format number with %f semantics: prec decimal places"
+  (cond
+    ((nan? n) "nan")
+    ((infinite? n) (if (positive? n) "inf" "-inf"))
+    (else
+     (let* ((sign (if (< n 0) "-" ""))
+            (abs-n (abs n))
+            (factor (expt 10 prec))
+            (rounded (/ (round (* abs-n factor)) factor))
+            (int-part (inexact->exact (floor rounded)))
+            (frac-part (inexact->exact (round (* (- rounded int-part) factor))))
+            (frac-str (number->string frac-part))
+            (frac-str (string-append (make-string (max 0 (- prec (string-length frac-str))) #\0)
+                                     frac-str)))
+       (if (= prec 0)
+         (string-append sign (number->string int-part))
+         (string-append sign (number->string int-part) "." frac-str))))))
+
+(def (format-e-number n prec upper?)
+  "Format number with %e semantics: prec decimal places in scientific notation"
+  (cond
+    ((nan? n) "nan")
+    ((infinite? n) (if (positive? n) "inf" "-inf"))
+    ((zero? n)
+     (string-append "0." (make-string prec #\0) (if upper? "E+00" "e+00")))
+    (else
+     (let* ((sign (if (< n 0) "-" ""))
+            (abs-n (abs n))
+            (exp (inexact->exact (floor (/ (log abs-n) (log 10)))))
+            (exp (if (>= abs-n (expt 10.0 (+ exp 1))) (+ exp 1) exp))
+            (mantissa (/ abs-n (expt 10.0 exp)))
+            (mant-str (format-f-number mantissa prec))
+            (exp-sign (if (>= exp 0) "+" "-"))
+            (exp-str (number->string (abs exp)))
+            (exp-str (if (< (string-length exp-str) 2)
+                       (string-append "0" exp-str) exp-str)))
+       (string-append sign mant-str (if upper? "E" "e") exp-sign exp-str)))))
 
 (def (strip-zeros s)
   "Strip trailing zeros after decimal point; remove dot if nothing follows"
@@ -175,19 +227,21 @@
 
 ;;; Main accessors
 
-(def (awk->string v)
+(def (awk->string v (ofmt #f))
   "Get string representation of AWK value"
   (cond
     ((string? v) v)
-    ((number? v) (number->string-awk v))
+    ((number? v) (number->string-awk v (or ofmt "%.6g")))
     ((not (awk-value? v)) (format "~a" v))
     ((flag-set? (awk-value-flags v) FLAG-STRCUR)
      (awk-value-str v))
     (else
      (let* ((num (awk-value-num v))
-            (s (number->string-awk num)))
-       (set! (awk-value-str v) s)
-       (set! (awk-value-flags v) (fxior (awk-value-flags v) FLAG-STRCUR))
+            (s (number->string-awk num (or ofmt "%.6g"))))
+       ;; Only cache if using default format
+       (unless ofmt
+         (set! (awk-value-str v) s)
+         (set! (awk-value-flags v) (fxior (awk-value-flags v) FLAG-STRCUR)))
        s))))
 
 (def (awk->number v)
@@ -276,13 +330,17 @@
   (let ((na (awk->number a))
         (nb (awk->number b)))
     (if (zero? nb)
-      (make-awk-number (/ (inexact na) 0.0))
+      (begin
+        (display "gawk: error: division by zero attempted\n" (current-error-port))
+        (exit 2))
       (make-awk-number (/ na nb)))))
 (def (awk-mod a b)
   (let ((na (awk->number a))
         (nb (awk->number b)))
     (if (zero? nb)
-      (make-awk-number (/ (inexact na) 0.0))
+      (begin
+        (display "gawk: error: division by zero attempted\n" (current-error-port))
+        (exit 2))
       (make-awk-number (- na (* (truncate (/ na nb)) nb))))))
 (def (awk-pow a b)
   (make-awk-number (expt (awk->number a) (awk->number b))))

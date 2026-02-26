@@ -186,6 +186,9 @@
       ;; Default FS=" " — split on runs of whitespace, strip leading/trailing
       ((string=? fs " ")
        (split-on-whitespace str))
+      ;; Empty FS — split into individual characters
+      ((string=? fs "")
+       (map string (string->list str)))
       ;; Single char FS
       ((= (string-length fs) 1)
        (split-on-char str (string-ref fs 0)))

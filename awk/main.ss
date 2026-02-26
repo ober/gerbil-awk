@@ -7,6 +7,9 @@
         :gerbil-pcre/pcre2/pcre2)
 (export main)
 
+;; Buffer for multi-char RS record splitting
+(def *record-buffer* '())
+
 ;;; CLI
 
 (def (main . args)
@@ -136,6 +139,7 @@
   (set! (awk-env-filename env) filename)
   (env-set! env 'FILENAME (make-awk-string filename))
   (set! (awk-env-fnr env) 0)
+  (set! *record-buffer* '())
   (let ((rs (env-get-str env 'RS)))
     (try
       (let loop ()
@@ -189,9 +193,9 @@
               (loop lines #f)))
            (else
             (loop (cons line lines) #t))))))
-    (else
+    ((= (string-length rs) 1)
      ;; Single character RS
-     (let ((sep (if (> (string-length rs) 0) (string-ref rs 0) #\newline)))
+     (let ((sep (string-ref rs 0)))
        (let loop ((chars '()))
          (let ((c (read-char port)))
            (cond
@@ -201,7 +205,31 @@
              ((char=? c sep)
               (list->string (reverse chars)))
              (else
-              (loop (cons c chars))))))))))
+              (loop (cons c chars))))))))
+    (else
+     ;; Multi-char RS — treat as regex (gawk extension)
+     ;; Buffer approach: read all input on first call, split by RS, return one at a time
+     (if (pair? *record-buffer*)
+       (let ((rec (car *record-buffer*)))
+         (set! *record-buffer* (cdr *record-buffer*))
+         rec)
+       ;; Read all remaining input and split by RS regex
+       (let loop ((chars '()))
+         (let ((c (read-char port)))
+           (if (eof-object? c)
+             (if (null? chars) #f
+                 (let* ((all (list->string (reverse chars)))
+                        (records (pcre2-split rs all))
+                        ;; Remove trailing empty record
+                        (records (if (and (pair? records)
+                                         (string=? (car (last-pair records)) ""))
+                                   (reverse (cdr (reverse records)))
+                                   records)))
+                   (if (null? records) #f
+                       (begin
+                         (set! *record-buffer* (cdr records))
+                         (car records)))))
+             (loop (cons c chars)))))))))
 
 ;;; Pattern evaluation
 
@@ -331,13 +359,14 @@
          (redir (awk-stmt-print-redirect stmt))
          (port (if redir (get-redir-output-port env redir) (current-output-port)))
          (ofs (env-get-str env 'OFS))
-         (ors (env-get-str env 'ORS)))
+         (ors (env-get-str env 'ORS))
+         (ofmt (env-get-str env 'OFMT)))
     (if (null? args)
-      (display (awk->string (env-get-field env 0)) port)
+      (display (awk->string (env-get-field env 0) ofmt) port)
       (let loop ((args args) (first? #t))
         (unless (null? args)
           (unless first? (display ofs port))
-          (display (awk->string (car args)) port)
+          (display (awk->string (car args) ofmt) port)
           (loop (cdr args) #f))))
     (display ors port)
     (force-output port)))
