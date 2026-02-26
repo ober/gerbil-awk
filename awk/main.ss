@@ -1,672 +1,667 @@
 ;; -*- Gerbil -*-
 ;;;; AWK Main Entry Point
-;;
-;; CLI handling, compilation, and execution.
 
-(import ./lexer ./parser ./ast ./value ./runtime ./fields
+(import ./lexer ./parser ./ast ./value ./runtime
         ./builtins/string ./builtins/math ./builtins/io
-        :std/getopt :std/sugar :std/format)
+        :std/getopt :std/format :std/srfi/13
+        :gerbil-pcre/pcre2/pcre2)
 (export main)
 
-;;; CLI Definition
+;;; CLI
 
-(def awk-cli
-  (getopt
-   (flag 'posix #\P "--posix" help: "POSIX mode")
-   (flag 'traditional #\c "--traditional" help: "Traditional AWK mode")
-   (flag 'lint #\L "--lint" help: "Enable lint warnings")
-   (flag 'sandbox #\S "--sandbox" help: "Sandbox mode (no system(), etc.)")
-   (option 'field-separator #\F "--field-separator" default: #f
-           help: "Field separator")
-   (option 'assign #\v "--assign" default: #f
-           help: "Variable assignment (var=value)")
-   (option 'file #\f "--file" default: #f
-           help: "Read program from file")
-   (option 'source #\e "--source" default: #f
-           help: "Program source text")
-   (rest-arguments 'files help: "Input files")))
-
-;;; Main entry point
-
-(def (main args)
+(def (main . args)
   (try
-    (let-values (((opt cmd-args) (getopt-parse awk-cli args)))
-      (run-awk opt cmd-args))
-    (catch (getopt-error? e)
-      (displayln (getopt-error-message e))
-      (exit 1))
+    (run-awk args)
+    (catch (awk-signal-exit? e)
+      (exit (awk-signal-exit-code e)))
     (catch (e)
       (display-exception e (current-error-port))
-      (exit 1))))
+      (exit 2))))
 
-(def (run-awk opt cmd-args)
-  (let* ((program-source (get-program-source opt cmd-args))
-         (prog (parse-awk-string program-source))
-         (rt (make-awk-runtime-initial))
-         (fs-opt (hash-get opt 'field-separator))
-         (assign-opt (hash-get opt 'assign)))
-    ;; Handle -F option
-    (when fs-opt
-      (awk-set-var! rt 'FS (make-awk-string fs-opt)))
-    ;; Handle -v assignments
-    (when assign-opt
-      (let ((parts (string-split assign-opt #\=)))
-        (when (= (length parts) 2)
-          (awk-set-var! rt (string->symbol (car parts))
-                        (make-awk-string (cadr parts))))))
-    ;; Initialize environment
-    (awk-init-environ! rt)
-    ;; Compile program
-    (let ((compiled (compile-program prog rt)))
-      ;; Run BEGIN blocks
-      (run-begin-blocks compiled rt)
-      ;; Process input files
-      (let ((files (hash-get opt 'files)))
-        (if (or (null? files) (equal? files '("-")))
-          (process-input compiled rt (current-input-port) "-")
-          (for-each
-           (lambda (file)
-             (if (string-contains file #\=)
-               ;; Variable assignment
-               (let ((parts (string-split file #\=)))
-                 (when (= (length parts) 2)
-                   (awk-set-var! rt (string->symbol (car parts))
-                                 (make-awk-string (cadr parts)))))
-               ;; Input file
-               (call-with-input-file file
-                 (lambda (port)
-                   (process-input compiled rt port file)))))
-           files)))
-      ;; Run END blocks
-      (run-end-blocks compiled rt)
-      ;; Return exit code
-      (when (awk-runtime-exit-code rt)
-        (exit (awk-runtime-exit-code rt))))))
+(def (run-awk args)
+  (let-values (((program-text files var-assigns fs) (parse-args args)))
+    (let* ((prog (parse-awk-string program-text))
+           (env (make-initial-env)))
+      ;; Apply -F
+      (when fs (env-set! env 'FS (make-awk-string fs)))
+      ;; Apply -v assignments (before BEGIN)
+      (for-each (lambda (va) (apply-var-assign! env va)) var-assigns)
+      ;; Register user functions
+      (hash-for-each
+       (lambda (name func) (hash-put! (awk-env-functions env) name func))
+       (awk-program-functions prog))
+      ;; Initialize ARGV and ENVIRON
+      (env-init-argv! env (cons "awk" files))
+      (env-init-environ! env)
+      ;; Run BEGIN
+      (run-rules env prog 'begin)
+      ;; Process files
+      (if (null? files)
+        (process-stream env prog (current-input-port) "-")
+        (process-files env prog files))
+      ;; Run END
+      (run-rules env prog 'end)
+      ;; Cleanup
+      (env-close-all! env)
+      (when (awk-env-exit-code env)
+        (exit (awk-env-exit-code env))))))
 
-(def (get-program-source opt cmd-args)
-  "Get program source from -f file or -e text or first argument"
-  (let ((file-opt (hash-get opt 'file))
-        (source-opt (hash-get opt 'source)))
-    (cond
-      (file-opt
-       (call-with-input-file file-opt read-all-string))
-      (source-opt source-opt)
-      ((null? cmd-args)
-       (error "no program specified"))
-      (else
-       (let ((prog (car cmd-args)))
-         ;; Remove program from args
-         (set! (hash-get opt 'files) (cdr cmd-args))
-         prog)))))
-
-(def (read-all-string port)
-  (let ((out (open-output-string)))
-    (let loop ()
-      (let ((line (read-line port)))
-        (if (eof-object? line)
-          (get-output-string out)
-          (begin
-            (display line out)
-            (newline out)
-            (loop)))))))
-
-;;; Compilation
-
-(defstruct compiled-program
-  (begin-actions    ; list of thunks
-   rules            ; list of compiled-rule
-   end-actions      ; list of thunks
-   functions)       ; hash-table of compiled functions
-  transparent: #t)
-
-(defstruct compiled-rule
-  (pattern-fn       ; () -> bool
-   action-fn        ; () -> void
-   range-state)     ; symbol for range tracking
-  transparent: #t)
-
-(def (compile-program prog rt)
-  "Compile AWK program to executable closures"
-  (let* ((functions (awk-runtime-functions rt))
-         (compiled-fns (make-hash-table)))
-    ;; First pass: collect function definitions
-    (hash-for-each
-     (lambda (name func)
-       (hash-put! compiled-fns name (compile-function func rt)))
-     (awk-program-functions prog))
-    ;; Compile rules
-    (let ((begin-actions '())
-          (end-actions '())
-          (compiled-rules '()))
-      (for-each
-       (lambda (rule)
-         (let ((pattern (awk-rule-pattern rule))
-               (action (awk-rule-action rule)))
+(def (parse-args args)
+  "Parse command-line arguments. Returns (values program-text files var-assigns fs)"
+  (let loop ((args args) (prog #f) (files '()) (vars '()) (fs #f) (expect #f))
+    (if (null? args)
+      (if prog
+        (values prog (reverse files) (reverse vars) fs)
+        (error "no program text"))
+      (let ((arg (car args))
+            (rest (cdr args)))
+        (case expect
+          ((fs) (loop rest prog files vars arg #f))
+          ((var) (loop rest prog files (cons arg vars) fs #f))
+          ((file)
+           (let ((text (read-file-to-string arg)))
+             (loop rest (if prog (string-append prog "\n" text) text) files vars fs #f)))
+          (else
            (cond
-             ((awk-pattern-begin? pattern)
-              (when action
-                (set! begin-actions
-                      (cons (compile-action action rt compiled-fns)
-                            begin-actions))))
-             ((awk-pattern-end? pattern)
-              (when action
-                (set! end-actions
-                      (cons (compile-action action rt compiled-fns)
-                            end-actions))))
+             ((string=? arg "-F")
+              (loop rest prog files vars fs 'fs))
+             ((and (> (string-length arg) 2) (string=? (substring arg 0 2) "-F"))
+              (loop rest prog files vars (substring arg 2 (string-length arg)) #f))
+             ((string=? arg "-v")
+              (loop rest prog files vars fs 'var))
+             ((and (> (string-length arg) 2) (string=? (substring arg 0 2) "-v"))
+              (loop rest prog files (cons (substring arg 2 (string-length arg)) vars) fs #f))
+             ((string=? arg "-f")
+              (loop rest prog files vars fs 'file))
+             ((string=? arg "--")
+              ;; Rest are files
+              (loop '() prog (append (reverse rest) files) vars fs #f))
+             ((not prog)
+              ;; First non-option arg is program text
+              (loop rest arg files vars fs #f))
              (else
-              (let ((rule-key (gensym 'rule)))
-                (set! compiled-rules
-                      (cons (make-compiled-rule
-                             (compile-pattern pattern rt compiled-fns rule-key)
-                             (compile-action (or action
-                                                (make-awk-stmt-block
-                                                 (list (make-awk-stmt-print '() #f #f))))
-                                            rt compiled-fns)
-                             rule-key)
-                            compiled-rules)))))))
-       (awk-program-rules prog))
-      (make-compiled-program
-       (reverse begin-actions)
-       (reverse compiled-rules)
-       (reverse end-actions)
-       compiled-fns))))
+              (loop rest prog (cons arg files) vars fs #f)))))))))
 
-(def (compile-function func rt compiled-fns)
-  "Compile a user-defined function"
-  (let ((params (awk-func-params func))
-        (body (awk-func-body func)))
-    (lambda (args)
-      (let ((local-vars (make-hash-table)))
-        ;; Bind parameters to arguments
-        (for-each
-         (lambda (param arg)
-           (hash-put! local-vars param arg))
-         params (if (< (length args) (length params))
-                   (append args (make-list (- (length params) (length args))
-                                           (make-awk-uninit)))
-                   args))
-        ;; Execute body with local scope
-        (parameterize ((current-local-vars local-vars))
-          (execute-statement body rt compiled-fns))))))
+(def (apply-var-assign! env str)
+  (let ((eq-pos (string-contains str "=")))
+    (when eq-pos
+      (let ((name (string->symbol (substring str 0 eq-pos)))
+            (val (substring str (+ eq-pos 1) (string-length str))))
+        (env-set! env name (make-awk-string val))))))
 
-(def current-local-vars (make-parameter #f))
+(def (read-file-to-string filename)
+  (call-with-input-file filename
+    (lambda (port)
+      (let loop ((lines '()))
+        (let ((line (read-line port)))
+          (if (eof-object? line)
+            (string-join (reverse lines) "\n")
+            (loop (cons line lines))))))))
 
-(def (compile-pattern pattern rt compiled-fns rule-key)
-  "Compile pattern to predicate function"
+;;; Rule execution
+
+(def (run-rules env prog phase)
+  "Run BEGIN or END rules"
+  (for-each
+   (lambda (rule)
+     (let ((pat (awk-rule-pattern rule)))
+       (when (case phase
+               ((begin) (awk-pattern-begin? pat))
+               ((end) (awk-pattern-end? pat))
+               (else #f))
+         (when (awk-rule-action rule)
+           (try
+             (exec-stmt env (awk-rule-action rule))
+             (catch (awk-signal-exit? e)
+               (set! (awk-env-exit-code env) (awk-signal-exit-code e))
+               (when (eq? phase 'begin)
+                 ;; Still run END blocks
+                 (run-rules env prog 'end)
+                 (env-close-all! env)
+                 (exit (awk-signal-exit-code e)))))))))
+   (awk-program-rules prog)))
+
+(def (process-files env prog files)
+  (for-each
+   (lambda (file)
+     ;; Check for var=value assignments in file list
+     (if (string-contains file "=")
+       (apply-var-assign! env file)
+       (call-with-input-file file
+         (lambda (port)
+           (process-stream env prog port file)))))
+   files))
+
+(def (process-stream env prog port filename)
+  (set! (awk-env-filename env) filename)
+  (env-set! env 'FILENAME (make-awk-string filename))
+  (set! (awk-env-fnr env) 0)
+  (let ((rs (env-get-str env 'RS)))
+    (try
+      (let loop ()
+        (let ((record (read-record port rs)))
+          (when record
+            ;; Update counters
+            (set! (awk-env-nr env) (+ (awk-env-nr env) 1))
+            (set! (awk-env-fnr env) (+ (awk-env-fnr env) 1))
+            ;; Set $0 and split fields
+            (env-set-record! env record)
+            ;; Update NR/FNR variables
+            (hash-put! (awk-env-globals env) 'NR (make-awk-number (awk-env-nr env)))
+            (hash-put! (awk-env-globals env) 'FNR (make-awk-number (awk-env-fnr env)))
+            ;; Execute main rules
+            (try
+              (for-each
+               (lambda (rule)
+                 (let ((pat (awk-rule-pattern rule)))
+                   (when (and (not (awk-pattern-begin? pat))
+                              (not (awk-pattern-end? pat)))
+                     (when (eval-pattern env pat rule)
+                       (let ((action (or (awk-rule-action rule)
+                                         (make-awk-stmt-block
+                                          (list (make-awk-stmt-print '() #f))))))
+                         (exec-stmt env action))))))
+               (awk-program-rules prog))
+              (catch (awk-signal-next? _) (void)))
+            (loop))))
+      (catch (awk-signal-exit? e)
+        (set! (awk-env-exit-code env) (awk-signal-exit-code e)))
+      (catch (awk-signal-nextfile? _) (void)))))
+
+(def (read-record port rs)
+  "Read one record from port according to RS"
   (cond
-    ((not pattern) (lambda () #t))
-    ((awk-pattern-expr? pattern)
-     (let ((expr-fn (compile-expr (awk-pattern-expr-expr pattern) rt compiled-fns)))
-       (lambda ()
-         (awk->bool (expr-fn)))))
-    ((awk-pattern-range? pattern)
-     (let ((start-fn (compile-pattern (awk-pattern-range-start pattern) rt compiled-fns rule-key))
-           (end-fn (compile-pattern (awk-pattern-range-end pattern) rt compiled-fns rule-key))
-           (state-key rule-key))
-       (lambda ()
-         (let* ((states (awk-runtime-range-states rt))
-                (in-range? (hash-ref states state-key #f)))
-           (if in-range?
-             ;; Check end
-             (if (end-fn)
-               (begin
-                 (hash-put! states state-key #f)
-                 #t)
-               #t)
-             ;; Check start
-             (if (start-fn)
-               (begin
-                 (hash-put! states state-key #t)
-                 ;; Check if end matches on same line
-                 (if (end-fn)
-                   (begin
-                     (hash-put! states state-key #f)
-                     #t)
-                   #t))
-               #f))))))
-    (else (lambda () #t))))
-
-(def (compile-action action rt compiled-fns)
-  "Compile action to executable thunk"
-  (lambda ()
-    (execute-statement action rt compiled-fns)))
-
-;;; Expression compilation
-
-(def (compile-expr expr rt compiled-fns)
-  "Compile expression to function that returns awk-value"
-  (cond
-    ((awk-expr-number? expr)
-     (let ((n (awk-expr-number-value expr)))
-       (lambda () (make-awk-number n))))
-    ((awk-expr-string? expr)
-     (let ((s (awk-expr-string-value expr)))
-       (lambda () (make-awk-string s))))
-    ((awk-expr-regex? expr)
-     (let ((pattern (awk-expr-regex-pattern expr)))
-       (lambda ()
-         ;; Regex in expression context matches against $0
-         (let* ((rx (make-regex pattern (awk-IGNORECASE rt)))
-                (line (awk->string (awk-get-field rt 0)))
-                (match? (pregexp-match rx line)))
-           (make-awk-number (if match? 1 0))))))
-    ((awk-expr-var? expr)
-     (let ((name (awk-expr-var-name expr)))
-       (lambda ()
-         (let ((local (current-local-vars)))
-           (if (and local (hash-key? local name))
-             (hash-ref local name)
-             (awk-get-or-create-var rt name))))))
-    ((awk-expr-field? expr)
-     (let ((index-fn (compile-expr (awk-expr-field-index expr) rt compiled-fns)))
-       (lambda ()
-         (let ((idx (inexact->exact (awk->number (index-fn)))))
-           (awk-get-field rt idx)))))
-    ((awk-expr-array-ref? expr)
-     (let ((name (awk-expr-array-ref-array expr))
-           (subscript-fns (map (lambda (e) (compile-expr e rt compiled-fns))
-                              (awk-expr-array-ref-subscripts expr))))
-       (lambda ()
-         (let ((subscript (string-join (map awk->string (map (lambda (f) (f)) subscript-fns))
-                                      (awk-SUBSEP rt))))
-           (awk-array-ref rt name subscript)))))
-    ((awk-expr-binop? expr)
-     (compile-binop expr rt compiled-fns))
-    ((awk-expr-unop? expr)
-     (compile-unop expr rt compiled-fns))
-    ((awk-expr-assign? expr)
-     (compile-assign expr rt compiled-fns))
-    ((awk-expr-assign-op? expr)
-     (compile-assign-op expr rt compiled-fns))
-    ((awk-expr-pre-inc? expr)
-     (compile-pre-inc expr rt compiled-fns))
-    ((awk-expr-pre-dec? expr)
-     (compile-pre-dec expr rt compiled-fns))
-    ((awk-expr-post-inc? expr)
-     (compile-post-inc expr rt compiled-fns))
-    ((awk-expr-post-dec? expr)
-     (compile-post-dec expr rt compiled-fns))
-    ((awk-expr-ternary? expr)
-     (compile-ternary expr rt compiled-fns))
-    ((awk-expr-concat? expr)
-     (compile-concat expr rt compiled-fns))
-    ((awk-expr-in? expr)
-     (compile-in expr rt compiled-fns))
-    ((awk-expr-call? expr)
-     (compile-call expr rt compiled-fns))
+    ((string=? rs "\n")
+     ;; Default: line-based
+     (let ((line (read-line port)))
+       (if (eof-object? line) #f line)))
+    ((string=? rs "")
+     ;; Paragraph mode: records separated by blank lines
+     (let loop ((lines '()) (started? #f))
+       (let ((line (read-line port)))
+         (cond
+           ((eof-object? line)
+            (if (null? lines) #f
+                (string-join (reverse lines) "\n")))
+           ((= (string-length line) 0)
+            (if started?
+              (string-join (reverse lines) "\n")
+              (loop lines #f)))
+           (else
+            (loop (cons line lines) #t))))))
     (else
-     (lambda () (make-awk-uninit)))))
+     ;; Single character RS
+     (let ((sep (if (> (string-length rs) 0) (string-ref rs 0) #\newline)))
+       (let loop ((chars '()))
+         (let ((c (read-char port)))
+           (cond
+             ((eof-object? c)
+              (if (null? chars) #f
+                  (list->string (reverse chars))))
+             ((char=? c sep)
+              (list->string (reverse chars)))
+             (else
+              (loop (cons c chars))))))))))
 
-(def (compile-binop expr rt compiled-fns)
-  (let ((op (awk-expr-binop-op expr))
-        (left-fn (compile-expr (awk-expr-binop-left expr) rt compiled-fns))
-        (right-fn (compile-expr (awk-expr-binop-right expr) rt compiled-fns)))
-    (case op
-      ((+) (lambda () (awk+ (left-fn) (right-fn))))
-      ((-) (lambda () (awk- (left-fn) (right-fn))))
-      ((*) (lambda () (awk* (left-fn) (right-fn))))
-      ((/) (lambda () (awk/ (left-fn) (right-fn))))
-      ((%) (lambda () (awk% (left-fn) (right-fn))))
-      ((^) (lambda () (awk^ (left-fn) (right-fn))))
-      ((<) (lambda () (make-awk-number (if (awk<? (left-fn) (right-fn)) 1 0))))
-      ((<=) (lambda () (make-awk-number (if (awk<=? (left-fn) (right-fn)) 1 0))))
-      ((>) (lambda () (make-awk-number (if (awk>? (left-fn) (right-fn)) 1 0))))
-      ((>=) (lambda () (make-awk-number (if (awk>=? (left-fn) (right-fn)) 1 0))))
-      ((==) (lambda () (make-awk-number (if (awk-equal? (left-fn) (right-fn)) 1 0))))
-      ((!=) (lambda () (make-awk-number (if (awk!=? (left-fn) (right-fn)) 1 0))))
-      ((~)
-       (lambda ()
-         (let* ((str (awk->string (left-fn)))
-                (pattern (awk->string (right-fn)))
-                (rx (make-regex pattern (awk-IGNORECASE rt))))
-           (make-awk-number (if (pregexp-match rx str) 1 0)))))
-      ((!~)
-       (lambda ()
-         (let* ((str (awk->string (left-fn)))
-                (pattern (awk->string (right-fn)))
-                (rx (make-regex pattern (awk-IGNORECASE rt))))
-           (make-awk-number (if (pregexp-match rx str) 0 1)))))
-      ((&&)
-       (lambda ()
-         (if (awk->bool (left-fn))
-           (make-awk-number (if (awk->bool (right-fn)) 1 0))
-           (make-awk-number 0))))
-      ((||)
-       (lambda ()
-         (if (awk->bool (left-fn))
-           (make-awk-number 1)
-           (make-awk-number (if (awk->bool (right-fn)) 1 0)))))
-      (else (lambda () (make-awk-number 0))))))
+;;; Pattern evaluation
 
-(def (compile-unop expr rt compiled-fns)
-  (let ((op (awk-expr-unop-op expr))
-        (operand-fn (compile-expr (awk-expr-unop-operand expr) rt compiled-fns)))
-    (case op
-      ((!) (lambda () (awk-not (operand-fn))))
-      ((-) (lambda () (awk-negate (operand-fn))))
-      ((+) (lambda () (awk-plus (operand-fn))))
-      (else (lambda () (make-awk-number 0))))))
-
-(def (compile-assign expr rt compiled-fns)
-  (let ((target (awk-expr-assign-target expr))
-        (value-fn (compile-expr (awk-expr-assign-value expr) rt compiled-fns)))
-    (cond
-      ((awk-expr-var? target)
-       (let ((name (awk-expr-var-name target)))
-         (lambda ()
-           (let ((val (value-fn)))
-             (let ((local (current-local-vars)))
-               (if local
-                 (hash-put! local name val)
-                 (awk-set-var! rt name val)))
-             val))))
-      ((awk-expr-field? target)
-       (let ((index-fn (compile-expr (awk-expr-field-index target) rt compiled-fns)))
-         (lambda ()
-           (let ((val (value-fn))
-                 (idx (inexact->exact (awk->number (index-fn)))))
-             (awk-set-field-index! rt idx val)
-             val))))
-      ((awk-expr-array-ref? target)
-       (let ((name (awk-expr-array-ref-array target))
-             (subscript-fns (map (lambda (e) (compile-expr e rt compiled-fns))
-                                (awk-expr-array-ref-subscripts target))))
-         (lambda ()
-           (let ((val (value-fn))
-                 (subscript (string-join (map awk->string (map (lambda (f) (f)) subscript-fns))
-                                        (awk-SUBSEP rt))))
-             (awk-array-set! rt name subscript val)
-             val)))))))
-
-(def (compile-assign-op expr rt compiled-fns)
-  (let* ((op (awk-expr-assign-op-op expr))
-         (target (awk-expr-assign-op-target expr))
-         (value-fn (compile-expr (awk-expr-assign-op-value expr) rt compiled-fns))
-         (get-fn (compile-expr target rt compiled-fns)))
-    (case op
-      ((+=)
-       (lambda ()
-         (let* ((old (get-fn))
-                (new (awk+ old (value-fn))))
-           ;; Store new value
-           new)))
-      ((-=)
-       (lambda ()
-         (let* ((old (get-fn))
-                (new (awk- old (value-fn))))
-           new)))
-      ((*=)
-       (lambda ()
-         (let* ((old (get-fn))
-                (new (awk* old (value-fn))))
-           new)))
-      ((/=)
-       (lambda ()
-         (let* ((old (get-fn))
-                (new (awk/ old (value-fn))))
-           new)))
-      ((%=)
-       (lambda ()
-         (let* ((old (get-fn))
-                (new (awk% old (value-fn))))
-           new)))
-      ((^=)
-       (lambda ()
-         (let* ((old (get-fn))
-                (new (awk^ old (value-fn))))
-           new))))))
-
-(def (compile-pre-inc expr rt compiled-fns)
-  (let ((get-fn (compile-expr (awk-expr-pre-inc-target expr) rt compiled-fns)))
-    (lambda ()
-      (let* ((old (awk->number (get-fn)))
-             (new (make-awk-number (+ old 1))))
-        new))))
-
-(def (compile-pre-dec expr rt compiled-fns)
-  (let ((get-fn (compile-expr (awk-expr-pre-dec-target expr) rt compiled-fns)))
-    (lambda ()
-      (let* ((old (awk->number (get-fn)))
-             (new (make-awk-number (- old 1))))
-        new))))
-
-(def (compile-post-inc expr rt compiled-fns)
-  (let ((get-fn (compile-expr (awk-expr-post-inc-target expr) rt compiled-fns)))
-    (lambda ()
-      (let* ((old (get-fn))
-             (new (make-awk-number (+ (awk->number old) 1))))
-        old))))
-
-(def (compile-post-dec expr rt compiled-fns)
-  (let ((get-fn (compile-expr (awk-expr-post-dec-target expr) rt compiled-fns)))
-    (lambda ()
-      (let* ((old (get-fn))
-             (new (make-awk-number (- (awk->number old) 1))))
-        old))))
-
-(def (compile-ternary expr rt compiled-fns)
-  (let ((cond-fn (compile-expr (awk-expr-ternary-condition expr) rt compiled-fns))
-        (then-fn (compile-expr (awk-expr-ternary-then-expr expr) rt compiled-fns))
-        (else-fn (compile-expr (awk-expr-ternary-else-expr expr) rt compiled-fns)))
-    (lambda ()
-      (if (awk->bool (cond-fn))
-        (then-fn)
-        (else-fn)))))
-
-(def (compile-concat expr rt compiled-fns)
-  (let ((left-fn (compile-expr (awk-expr-concat-left expr) rt compiled-fns))
-        (right-fn (compile-expr (awk-expr-concat-right expr) rt compiled-fns)))
-    (lambda ()
-      (awk-concat (left-fn) (right-fn)))))
-
-(def (compile-in expr rt compiled-fns)
-  (let ((subscript-fns (map (lambda (e) (compile-expr e rt compiled-fns))
-                           (awk-expr-in-subscripts expr)))
-        (array-name (awk-expr-in-array expr)))
-    (lambda ()
-      (let ((subscript (string-join (map awk->string (map (lambda (f) (f)) subscript-fns))
-                                   (awk-SUBSEP rt))))
-        (make-awk-number (if (awk-array-exists? rt array-name subscript) 1 0))))))
-
-(def (compile-call expr rt compiled-fns)
-  (let ((name (awk-expr-call-name expr))
-        (arg-fns (map (lambda (e) (compile-expr e rt compiled-fns))
-                     (awk-expr-call-args expr))))
-    (cond
-      ;; Built-in functions
-      ((eq? name 'length)
-       (lambda () (awk-builtin-length rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'substr)
-       (lambda () (awk-builtin-substr rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'index)
-       (lambda () (awk-builtin-index rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'split)
-       (lambda () (awk-builtin-split rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'sub)
-       (lambda () (awk-builtin-sub rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'gsub)
-       (lambda () (awk-builtin-gsub rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'match)
-       (lambda () (awk-builtin-match rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'sprintf)
-       (lambda () (awk-builtin-sprintf rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'tolower)
-       (lambda () (awk-builtin-tolower rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'toupper)
-       (lambda () (awk-builtin-toupper rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'sin)
-       (lambda () (awk-builtin-sin rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'cos)
-       (lambda () (awk-builtin-cos rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'atan2)
-       (lambda () (awk-builtin-atan2 rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'exp)
-       (lambda () (awk-builtin-exp rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'log)
-       (lambda () (awk-builtin-log rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'sqrt)
-       (lambda () (awk-builtin-sqrt rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'int)
-       (lambda () (awk-builtin-int rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'rand)
-       (lambda () (awk-builtin-rand rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'srand)
-       (lambda () (awk-builtin-srand rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'close)
-       (lambda () (awk-builtin-close rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'system)
-       (lambda () (awk-builtin-system rt (map (lambda (f) (f)) arg-fns))))
-      ((eq? name 'fflush)
-       (lambda () (awk-builtin-fflush rt (map (lambda (f) (f)) arg-fns))))
-      ;; User-defined function
-      ((hash-key? compiled-fns name)
-       (lambda ()
-         (let ((fn (hash-ref compiled-fns name)))
-           (fn (map (lambda (f) (f)) arg-fns)))))
-      (else
-       (lambda () (error "awk: unknown function" name))))))
+(def (eval-pattern env pat rule)
+  (cond
+    ((not pat) #t)
+    ((awk-pattern-expr? pat)
+     (awk->bool (eval-expr env (awk-pattern-expr-expr pat))))
+    ((awk-pattern-range? pat)
+     (let* ((key (eq?-hash rule))
+            (states (awk-env-range-states env))
+            (in-range? (hash-ref states key #f)))
+       (if in-range?
+         (begin
+           (when (awk->bool (eval-expr env (awk-pattern-expr-expr (awk-pattern-range-end pat))))
+             (hash-put! states key #f))
+           #t)
+         (if (awk->bool (eval-expr env (awk-pattern-expr-expr (awk-pattern-range-start pat))))
+           (begin
+             (hash-put! states key #t)
+             ;; Check if end matches same record
+             (when (awk->bool (eval-expr env (awk-pattern-expr-expr (awk-pattern-range-end pat))))
+               (hash-put! states key #f))
+             #t)
+           #f))))
+    (else #t)))
 
 ;;; Statement execution
 
-(def (execute-statement stmt rt compiled-fns)
+(def (exec-stmt env stmt)
   (cond
     ((awk-stmt-block? stmt)
-     (for-each
-      (lambda (s) (execute-statement s rt compiled-fns))
-      (awk-stmt-block-stmts stmt)))
+     (for-each (lambda (s) (exec-stmt env s))
+               (awk-stmt-block-stmts stmt)))
     ((awk-stmt-if? stmt)
-     (let ((cond-fn (compile-expr (awk-stmt-if-condition stmt) rt compiled-fns)))
-       (if (awk->bool (cond-fn))
-         (execute-statement (awk-stmt-if-then-branch stmt) rt compiled-fns)
-         (when (awk-stmt-if-else-branch stmt)
-           (execute-statement (awk-stmt-if-else-branch stmt) rt compiled-fns)))))
+     (if (awk->bool (eval-expr env (awk-stmt-if-condition stmt)))
+       (exec-stmt env (awk-stmt-if-then-branch stmt))
+       (when (awk-stmt-if-else-branch stmt)
+         (exec-stmt env (awk-stmt-if-else-branch stmt)))))
     ((awk-stmt-while? stmt)
-     (let ((cond-fn (compile-expr (awk-stmt-while-condition stmt) rt compiled-fns)))
-       (try
-        (let loop ()
-          (when (awk->bool (cond-fn))
-            (try
-             (execute-statement (awk-stmt-while-body stmt) rt compiled-fns)
-             (catch (awk-continue?)
-               (void)))
-            (loop)))
-        (catch (awk-break?)
-          (void)))))
+     (try
+       (let loop ()
+         (when (awk->bool (eval-expr env (awk-stmt-while-condition stmt)))
+           (try (exec-stmt env (awk-stmt-while-body stmt))
+                (catch (awk-signal-continue? _) (void)))
+           (loop)))
+       (catch (awk-signal-break? _) (void))))
+    ((awk-stmt-do-while? stmt)
+     (try
+       (let loop ()
+         (try (exec-stmt env (awk-stmt-do-while-body stmt))
+              (catch (awk-signal-continue? _) (void)))
+         (when (awk->bool (eval-expr env (awk-stmt-do-while-condition stmt)))
+           (loop)))
+       (catch (awk-signal-break? _) (void))))
     ((awk-stmt-for? stmt)
-     (let ((init-fn (and (awk-stmt-for-init stmt)
-                        (compile-expr (awk-stmt-for-init stmt) rt compiled-fns)))
-           (cond-fn (and (awk-stmt-for-condition stmt)
-                        (compile-expr (awk-stmt-for-condition stmt) rt compiled-fns)))
-           (update-fn (and (awk-stmt-for-update stmt)
-                          (compile-expr (awk-stmt-for-update stmt) rt compiled-fns))))
-       (when init-fn (init-fn))
-       (try
-        (let loop ()
-          (when (or (not cond-fn) (awk->bool (cond-fn)))
-            (try
-             (execute-statement (awk-stmt-for-body stmt) rt compiled-fns)
-             (catch (awk-continue?)
-               (void)))
-            (when update-fn (update-fn))
-            (loop)))
-        (catch (awk-break?)
-          (void)))))
+     (when (awk-stmt-for-init stmt)
+       (eval-expr env (awk-stmt-for-init stmt)))
+     (try
+       (let loop ()
+         (when (or (not (awk-stmt-for-condition stmt))
+                   (awk->bool (eval-expr env (awk-stmt-for-condition stmt))))
+           (try (exec-stmt env (awk-stmt-for-body stmt))
+                (catch (awk-signal-continue? _) (void)))
+           (when (awk-stmt-for-update stmt)
+             (eval-expr env (awk-stmt-for-update stmt)))
+           (loop)))
+       (catch (awk-signal-break? _) (void))))
     ((awk-stmt-for-in? stmt)
-     (let ((var (awk-stmt-for-in-var stmt))
-           (array-name (awk-stmt-for-in-array stmt))
-           (body (awk-stmt-for-in-body stmt)))
-       (let ((arr (awk-get-array rt array-name #f)))
-         (when arr
-           (try
-            (hash-for-each
-             (lambda (key val)
-               (awk-set-var! rt (string->symbol var) (make-awk-string key))
-               (try
-                (execute-statement body rt compiled-fns)
-                (catch (awk-continue?)
-                  (void))))
-             arr)
-            (catch (awk-break?)
-              (void)))))))
-    ((awk-stmt-break? stmt)
-     (raise (make-awk-break)))
-    ((awk-stmt-continue? stmt)
-     (raise (make-awk-continue)))
-    ((awk-stmt-next? stmt)
-     (raise (make-awk-next)))
-    ((awk-stmt-nextfile? stmt)
-     (raise (make-awk-nextfile)))
+     (let* ((arr-name (awk-stmt-for-in-array stmt))
+            (var-name (awk-stmt-for-in-var stmt))
+            (arr (and (hash-key? (awk-env-arrays env) arr-name)
+                      (hash-ref (awk-env-arrays env) arr-name))))
+       (when arr
+         (try
+           (hash-for-each
+            (lambda (key val)
+              (env-set! env var-name (make-awk-string key))
+              (try (exec-stmt env (awk-stmt-for-in-body stmt))
+                   (catch (awk-signal-continue? _) (void))))
+            arr)
+           (catch (awk-signal-break? _) (void))))))
+    ((awk-stmt-break? stmt) (raise (make-awk-signal-break)))
+    ((awk-stmt-continue? stmt) (raise (make-awk-signal-continue)))
+    ((awk-stmt-next? stmt) (raise (make-awk-signal-next)))
+    ((awk-stmt-nextfile? stmt) (raise (make-awk-signal-nextfile)))
     ((awk-stmt-exit? stmt)
-     (let ((code-fn (and (awk-stmt-exit-code stmt)
-                        (compile-expr (awk-stmt-exit-code stmt) rt compiled-fns))))
-       (set! (awk-runtime-exit-code rt)
-             (if code-fn (inexact->exact (awk->number (code-fn))) 0))
-       (raise (make-awk-exit (awk-runtime-exit-code rt)))))
+     (let ((code (if (awk-stmt-exit-code stmt)
+                   (inexact->exact (floor (awk->number (eval-expr env (awk-stmt-exit-code stmt)))))
+                   0)))
+       (set! (awk-env-exit-code env) code)
+       (raise (make-awk-signal-exit code))))
     ((awk-stmt-return? stmt)
-     (let ((val-fn (and (awk-stmt-return-value stmt)
-                       (compile-expr (awk-stmt-return-value stmt) rt compiled-fns))))
-       (raise (make-awk-return (and val-fn (val-fn))))))
+     (let ((val (if (awk-stmt-return-value stmt)
+                  (eval-expr env (awk-stmt-return-value stmt))
+                  (make-awk-uninit))))
+       (raise (make-awk-signal-return val))))
     ((awk-stmt-delete? stmt)
-     (let ((array-name (awk-stmt-delete-array stmt))
-           (subscript (awk-stmt-delete-subscript stmt)))
-       (if subscript
-         (let ((sub-fns (map (lambda (e) (compile-expr e rt compiled-fns)) subscript)))
-           (let ((sub (string-join (map awk->string (map (lambda (f) (f)) sub-fns))
-                                  (awk-SUBSEP rt))))
-             (awk-array-delete! rt array-name sub)))
-         (awk-array-delete! rt array-name #f))))
+     (exec-delete env (awk-stmt-delete-target stmt)))
     ((awk-stmt-print? stmt)
-     (let ((arg-fns (map (lambda (e) (compile-expr e rt compiled-fns))
-                        (awk-stmt-print-args stmt))))
-       (let ((vals (map (lambda (f) (f)) arg-fns)))
-         (if (null? vals)
-           (displayln (awk->string (awk-get-field rt 0)))
-           (displayln (string-join (map awk->string vals) (awk-OFS rt)))))))
+     (exec-print env stmt))
     ((awk-stmt-printf? stmt)
-     (let ((fmt-fn (compile-expr (awk-stmt-printf-format stmt) rt compiled-fns))
-           (arg-fns (map (lambda (e) (compile-expr e rt compiled-fns))
-                        (awk-stmt-printf-args stmt))))
-       (display (awk-printf-format (awk->string (fmt-fn))
-                                   (map (lambda (f) (f)) arg-fns)
-                                   rt))))
+     (exec-printf env stmt))
     ((awk-stmt-expr? stmt)
-     (let ((expr-fn (compile-expr (awk-stmt-expr-expr stmt) rt compiled-fns)))
-       (expr-fn)))))
+     (eval-expr env (awk-stmt-expr-expr stmt)))
+    (else (void))))
 
-;;; Execution phases
+;;; Delete
 
-(def (run-begin-blocks compiled rt)
-  (for-each
-   (lambda (action) (action))
-   (compiled-program-begin-actions compiled)))
+(def (exec-delete env target)
+  (cond
+    ((awk-expr-array-ref? target)
+     (let* ((name (awk-expr-array-ref-name target))
+            (subs (map (lambda (e) (awk->string (eval-expr env e)))
+                       (awk-expr-array-ref-subscripts target)))
+            (key (string-join subs (env-get-str env 'SUBSEP))))
+       (env-array-delete! env name key)))
+    ((awk-expr-var? target)
+     (env-array-delete! env (awk-expr-var-name target) #f))
+    (else (void))))
 
-(def (run-end-blocks compiled rt)
-  (for-each
-   (lambda (action) (action))
-   (compiled-program-end-actions compiled)))
+;;; Print
 
-(def (process-input compiled rt port filename)
-  "Process all records from input port"
-  (set! (awk-runtime-filename rt) filename)
-  (awk-set-var! rt 'FILENAME (make-awk-string filename))
-  (let loop ()
-    (let ((line (read-line port)))
-      (unless (eof-object? line)
-        ;; Set $0 and split fields
-        (awk-set-$0! rt line)
-        ;; Update record counters
-        (set! (awk-runtime-nr rt) (+ (awk-runtime-nr rt) 1))
-        (set! (awk-runtime-fnr rt) (+ (awk-runtime-fnr rt) 1))
-        (awk-set-var! rt 'NR (make-awk-number (awk-runtime-nr rt)))
-        (awk-set-var! rt 'FNR (make-awk-number (awk-runtime-fnr rt)))
-        (awk-set-var! rt 'NF (make-awk-number (awk-runtime-nf rt)))
-        ;; Execute rules
-        (try
-         (for-each
-          (lambda (rule)
-            (when ((compiled-rule-pattern-fn rule))
-              ((compiled-rule-action-fn rule))))
-          (compiled-program-rules compiled))
-         (catch (awk-next?)
-           (void)))
-        (loop)))))
+(def (exec-print env stmt)
+  (let* ((args (map (lambda (e) (eval-expr env e))
+                    (awk-stmt-print-args stmt)))
+         (redir (awk-stmt-print-redirect stmt))
+         (port (if redir (get-redir-output-port env redir) (current-output-port)))
+         (ofs (env-get-str env 'OFS))
+         (ors (env-get-str env 'ORS)))
+    (if (null? args)
+      (display (awk->string (env-get-field env 0)) port)
+      (let loop ((args args) (first? #t))
+        (unless (null? args)
+          (unless first? (display ofs port))
+          (display (awk->string (car args)) port)
+          (loop (cdr args) #f))))
+    (display ors port)
+    (force-output port)))
+
+(def (exec-printf env stmt)
+  (let* ((fmt (awk->string (eval-expr env (awk-stmt-printf-format stmt))))
+         (args (map (lambda (e) (eval-expr env e))
+                    (awk-stmt-printf-args stmt)))
+         (redir (awk-stmt-printf-redirect stmt))
+         (port (if redir (get-redir-output-port env redir) (current-output-port)))
+         (text (awk-sprintf fmt args)))
+    (display text port)
+    (force-output port)))
+
+(def (get-redir-output-port env redir)
+  (let ((type (awk-redirect-type redir))
+        (target (awk->string (eval-expr env (awk-redirect-target redir)))))
+    (case type
+      ((file) (env-get-output-port env target #f))
+      ((append) (env-get-output-port env target #t))
+      ((pipe) (env-get-pipe-port env target))
+      (else (current-output-port)))))
+
+;;; Expression evaluation
+
+(def (eval-expr env expr)
+  (cond
+    ((awk-expr-number? expr)
+     (make-awk-number (awk-expr-number-value expr)))
+    ((awk-expr-string? expr)
+     (make-awk-string (awk-expr-string-value expr)))
+    ((awk-expr-regex? expr)
+     ;; Regex in expression context: match against $0
+     (let* ((pattern (awk-expr-regex-pattern expr))
+            (line (awk->string (env-get-field env 0))))
+       (make-awk-number (if (pcre2-search pattern line) 1 0))))
+    ((awk-expr-var? expr)
+     (env-get env (awk-expr-var-name expr)))
+    ((awk-expr-field? expr)
+     (let ((idx (inexact->exact (floor (awk->number (eval-expr env (awk-expr-field-index expr)))))))
+       (env-get-field env (max 0 idx))))
+    ((awk-expr-array-ref? expr)
+     (let* ((name (awk-expr-array-ref-name expr))
+            (subs (map (lambda (e) (awk->string (eval-expr env e)))
+                       (awk-expr-array-ref-subscripts expr)))
+            (key (string-join subs (env-get-str env 'SUBSEP))))
+       (env-array-ref env name key)))
+    ((awk-expr-assign? expr)
+     (let ((val (eval-expr env (awk-expr-assign-value expr))))
+       (assign-target! env (awk-expr-assign-target expr) val)
+       val))
+    ((awk-expr-assign-op? expr)
+     (let* ((target (awk-expr-assign-op-target expr))
+            (old (eval-expr env target))
+            (rhs (eval-expr env (awk-expr-assign-op-value expr)))
+            (new (case (awk-expr-assign-op-op expr)
+                   ((+=) (awk+ old rhs))
+                   ((-=) (awk- old rhs))
+                   ((*=) (awk* old rhs))
+                   ((/=) (awk/ old rhs))
+                   ((%=) (awk-mod old rhs))
+                   ((^=) (awk-pow old rhs)))))
+       (assign-target! env target new)
+       new))
+    ((awk-expr-pre-inc? expr)
+     (let* ((target (awk-expr-pre-inc-target expr))
+            (old (awk->number (eval-expr env target)))
+            (new (make-awk-number (+ old 1))))
+       (assign-target! env target new)
+       new))
+    ((awk-expr-pre-dec? expr)
+     (let* ((target (awk-expr-pre-dec-target expr))
+            (old (awk->number (eval-expr env target)))
+            (new (make-awk-number (- old 1))))
+       (assign-target! env target new)
+       new))
+    ((awk-expr-post-inc? expr)
+     (let* ((target (awk-expr-post-inc-target expr))
+            (old (eval-expr env target))
+            (old-num (awk->number old))
+            (new (make-awk-number (+ old-num 1))))
+       (assign-target! env target new)
+       (make-awk-number old-num)))
+    ((awk-expr-post-dec? expr)
+     (let* ((target (awk-expr-post-dec-target expr))
+            (old (eval-expr env target))
+            (old-num (awk->number old))
+            (new (make-awk-number (- old-num 1))))
+       (assign-target! env target new)
+       (make-awk-number old-num)))
+    ((awk-expr-binop? expr)
+     (eval-binop env expr))
+    ((awk-expr-unop? expr)
+     (let ((val (eval-expr env (awk-expr-unop-operand expr))))
+       (case (awk-expr-unop-op expr)
+         ((!) (awk-not val))
+         ((-) (awk-negate val))
+         ((+) (awk-plus val)))))
+    ((awk-expr-ternary? expr)
+     (if (awk->bool (eval-expr env (awk-expr-ternary-condition expr)))
+       (eval-expr env (awk-expr-ternary-then-expr expr))
+       (eval-expr env (awk-expr-ternary-else-expr expr))))
+    ((awk-expr-concat? expr)
+     (awk-concat (eval-expr env (awk-expr-concat-left expr))
+                 (eval-expr env (awk-expr-concat-right expr))))
+    ((awk-expr-in? expr)
+     (let* ((subs (map (lambda (e) (awk->string (eval-expr env e)))
+                       (awk-expr-in-subscripts expr)))
+            (key (string-join subs (env-get-str env 'SUBSEP)))
+            (arr-name (awk-expr-in-array expr)))
+       (make-awk-number (if (env-array-exists? env arr-name key) 1 0))))
+    ((awk-expr-match? expr)
+     (let* ((str (awk->string (eval-expr env (awk-expr-match-expr expr))))
+            (pat (let ((p (awk-expr-match-pattern expr)))
+                   (if (awk-expr-regex? p)
+                     (awk-expr-regex-pattern p)
+                     (awk->string (eval-expr env p)))))
+            (matched? (pcre2-search pat str)))
+       (make-awk-number (if (awk-expr-match-negate? expr)
+                          (if matched? 0 1)
+                          (if matched? 1 0)))))
+    ((awk-expr-call? expr)
+     (eval-call env expr))
+    ((awk-expr-getline? expr)
+     (eval-getline env expr))
+    (else (make-awk-uninit))))
+
+(def (eval-binop env expr)
+  (let ((op (awk-expr-binop-op expr)))
+    (case op
+      ((&&)
+       (make-awk-number
+        (if (and (awk->bool (eval-expr env (awk-expr-binop-left expr)))
+                 (awk->bool (eval-expr env (awk-expr-binop-right expr))))
+          1 0)))
+      ((||)
+       (make-awk-number
+        (if (or (awk->bool (eval-expr env (awk-expr-binop-left expr)))
+                (awk->bool (eval-expr env (awk-expr-binop-right expr))))
+          1 0)))
+      (else
+       (let ((left (eval-expr env (awk-expr-binop-left expr)))
+             (right (eval-expr env (awk-expr-binop-right expr))))
+         (case op
+           ((+)  (awk+ left right))
+           ((-)  (awk- left right))
+           ((*)  (awk* left right))
+           ((/)  (awk/ left right))
+           ((%)  (awk-mod left right))
+           ((^)  (awk-pow left right))
+           ((<)  (make-awk-number (if (awk<? left right) 1 0)))
+           ((<=) (make-awk-number (if (awk<=? left right) 1 0)))
+           ((>)  (make-awk-number (if (awk>? left right) 1 0)))
+           ((>=) (make-awk-number (if (awk>=? left right) 1 0)))
+           ((==) (make-awk-number (if (awk-equal? left right) 1 0)))
+           ((!=) (make-awk-number (if (awk!=? left right) 1 0)))
+           (else (make-awk-number 0))))))))
+
+;;; Assignment to lvalues
+
+(def (assign-target! env target val)
+  (cond
+    ((awk-expr-var? target)
+     (let ((name (awk-expr-var-name target)))
+       (case name
+         ((NF) (env-set-nf! env (inexact->exact (floor (awk->number val)))))
+         (else (env-set! env name val)))))
+    ((awk-expr-field? target)
+     (let ((idx (inexact->exact (floor (awk->number (eval-expr env (awk-expr-field-index target)))))))
+       (if (= idx 0)
+         (env-set-record! env (awk->string val))
+         (env-set-field! env idx val))))
+    ((awk-expr-array-ref? target)
+     (let* ((name (awk-expr-array-ref-name target))
+            (subs (map (lambda (e) (awk->string (eval-expr env e)))
+                       (awk-expr-array-ref-subscripts target)))
+            (key (string-join subs (env-get-str env 'SUBSEP))))
+       (env-array-set! env name key val)))
+    (else (void))))
+
+;;; Function calls
+
+(def (eval-call env expr)
+  (let ((name (awk-expr-call-name expr))
+        (arg-exprs (awk-expr-call-args expr)))
+    ;; Check builtins first
+    (case name
+      ((length)
+       ;; length(x) — if x is an array name, return element count
+       (if (and (pair? arg-exprs)
+                (awk-expr-var? (car arg-exprs))
+                (hash-key? (awk-env-arrays env) (awk-expr-var-name (car arg-exprs))))
+         (make-awk-number (hash-length (env-get-array env (awk-expr-var-name (car arg-exprs)))))
+         (let ((args (map (lambda (e) (eval-expr env e)) arg-exprs)))
+           (awk-builtin-length env args))))
+      ((substr)
+       (let ((args (map (lambda (e) (eval-expr env e)) arg-exprs)))
+         (awk-builtin-substr env args)))
+      ((index)
+       (let ((args (map (lambda (e) (eval-expr env e)) arg-exprs)))
+         (awk-builtin-index env args)))
+      ((split)
+       ;; split needs array name as symbol
+       ;; split(str, arr [, fs]) — fs can be string or regex
+       (let* ((str (eval-expr env (car arg-exprs)))
+              (arr-name (if (awk-expr-var? (cadr arg-exprs))
+                          (awk-expr-var-name (cadr arg-exprs))
+                          (string->symbol (awk->string (eval-expr env (cadr arg-exprs))))))
+              (fs-arg (if (> (length arg-exprs) 2)
+                        (let ((fs-expr (caddr arg-exprs)))
+                          ;; Regex literal: extract pattern string
+                          (if (awk-expr-regex? fs-expr)
+                            (make-awk-string (awk-expr-regex-pattern fs-expr))
+                            (eval-expr env fs-expr)))
+                        #f))
+              (args (if fs-arg (list str arr-name fs-arg) (list str arr-name))))
+         (awk-builtin-split env args)))
+      ((sub)
+       ;; sub(ere, repl [, target]) — target is lvalue
+       (let* ((ere (let ((e (car arg-exprs)))
+                     (if (awk-expr-regex? e) e (eval-expr env e))))
+              (repl (awk->string (eval-expr env (cadr arg-exprs))))
+              (target-expr (if (> (length arg-exprs) 2)
+                             (caddr arg-exprs)
+                             (make-awk-expr-field (make-awk-expr-number 0))))
+              (target-val (eval-expr env target-expr)))
+         (awk-builtin-sub env arg-exprs ere repl target-val
+                          (lambda (v) (assign-target! env target-expr v)))))
+      ((gsub)
+       (let* ((ere (let ((e (car arg-exprs)))
+                     (if (awk-expr-regex? e) e (eval-expr env e))))
+              (repl (awk->string (eval-expr env (cadr arg-exprs))))
+              (target-expr (if (> (length arg-exprs) 2)
+                             (caddr arg-exprs)
+                             (make-awk-expr-field (make-awk-expr-number 0))))
+              (target-val (eval-expr env target-expr)))
+         (awk-builtin-gsub env arg-exprs ere repl target-val
+                           (lambda (v) (assign-target! env target-expr v)))))
+      ((match)
+       (let* ((str (eval-expr env (car arg-exprs)))
+              (ere (let ((e (cadr arg-exprs)))
+                     (if (awk-expr-regex? e) e (eval-expr env e)))))
+         (awk-builtin-match env (list str ere))))
+      ((sprintf)
+       (let ((args (map (lambda (e) (eval-expr env e)) arg-exprs)))
+         (awk-builtin-sprintf env args)))
+      ((tolower)
+       (let ((args (map (lambda (e) (eval-expr env e)) arg-exprs)))
+         (awk-builtin-tolower env args)))
+      ((toupper)
+       (let ((args (map (lambda (e) (eval-expr env e)) arg-exprs)))
+         (awk-builtin-toupper env args)))
+      ((sin) (awk-builtin-sin env (map (lambda (e) (eval-expr env e)) arg-exprs)))
+      ((cos) (awk-builtin-cos env (map (lambda (e) (eval-expr env e)) arg-exprs)))
+      ((atan2) (awk-builtin-atan2 env (map (lambda (e) (eval-expr env e)) arg-exprs)))
+      ((exp) (awk-builtin-exp env (map (lambda (e) (eval-expr env e)) arg-exprs)))
+      ((log) (awk-builtin-log env (map (lambda (e) (eval-expr env e)) arg-exprs)))
+      ((sqrt) (awk-builtin-sqrt env (map (lambda (e) (eval-expr env e)) arg-exprs)))
+      ((int) (awk-builtin-int env (map (lambda (e) (eval-expr env e)) arg-exprs)))
+      ((rand) (awk-builtin-rand env '()))
+      ((srand) (awk-builtin-srand env (map (lambda (e) (eval-expr env e)) arg-exprs)))
+      ((close) (awk-builtin-close env (map (lambda (e) (eval-expr env e)) arg-exprs)))
+      ((system) (awk-builtin-system env (map (lambda (e) (eval-expr env e)) arg-exprs)))
+      ((fflush) (awk-builtin-fflush env (map (lambda (e) (eval-expr env e)) arg-exprs)))
+      (else
+       ;; User-defined function
+       (let ((func (hash-ref (awk-env-functions env) name #f)))
+         (if func
+           (let ((args (map (lambda (e) (eval-expr env e)) arg-exprs)))
+             (env-push-locals! env (awk-func-params func) args)
+             (let ((result
+                    (try
+                      (exec-stmt env (awk-func-body func))
+                      (make-awk-uninit)
+                      (catch (awk-signal-return? e)
+                        (or (awk-signal-return-value e) (make-awk-uninit))))))
+               (env-pop-locals! env)
+               result))
+           (error (string-append "awk: unknown function: " (symbol->string name)))))))))
+
+;;; Getline
+
+(def (eval-getline env expr)
+  (let* ((var (awk-expr-getline-var expr))
+         (source (awk-expr-getline-source expr))
+         (cmd? (awk-expr-getline-command? expr)))
+    (cond
+      (cmd?
+       ;; cmd | getline [var]
+       (let* ((cmd (awk->string (eval-expr env source)))
+              (port (env-get-input-pipe-port env cmd))
+              (line (read-line port)))
+         (if (eof-object? line)
+           (make-awk-number 0)
+           (begin
+             (set! (awk-env-nr env) (+ (awk-env-nr env) 1))
+             (if var
+               (env-set! env var (make-awk-string line))
+               (begin
+                 (env-set-record! env line)
+                 (set! (awk-env-fnr env) (+ (awk-env-fnr env) 1))))
+             (make-awk-number 1)))))
+      (source
+       ;; getline [var] < file
+       (let* ((filename (awk->string (eval-expr env source)))
+              (port (env-get-input-port env filename))
+              (line (read-line port)))
+         (if (eof-object? line)
+           (make-awk-number 0)
+           (begin
+             (if var
+               (env-set! env var (make-awk-string line))
+               (env-set-record! env line))
+             (make-awk-number 1)))))
+      (else
+       ;; Plain getline (from stdin)
+       (let ((line (read-line (current-input-port))))
+         (if (eof-object? line)
+           (make-awk-number 0)
+           (begin
+             (set! (awk-env-nr env) (+ (awk-env-nr env) 1))
+             (if var
+               (env-set! env var (make-awk-string line))
+               (begin
+                 (env-set-record! env line)
+                 (set! (awk-env-fnr env) (+ (awk-env-fnr env) 1))))
+             (make-awk-number 1))))))))

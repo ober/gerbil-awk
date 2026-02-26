@@ -4,121 +4,52 @@
 (import ../value)
 (export #t)
 
-;;; sin(x)
-(def (awk-builtin-sin rt args)
-  (match args
-    ([x] (make-awk-number (sin (awk->number x))))
-    (_ (error "awk: sin: wrong number of arguments"))))
+(def (awk-builtin-sin env args)
+  (make-awk-number (sin (awk->number (car args)))))
 
-;;; cos(x)
-(def (awk-builtin-cos rt args)
-  (match args
-    ([x] (make-awk-number (cos (awk->number x))))
-    (_ (error "awk: cos: wrong number of arguments"))))
+(def (awk-builtin-cos env args)
+  (make-awk-number (cos (awk->number (car args)))))
 
-;;; atan2(y, x)
-(def (awk-builtin-atan2 rt args)
-  (match args
-    ([y x] (make-awk-number (atan (awk->number y) (awk->number x))))
-    (_ (error "awk: atan2: wrong number of arguments"))))
+(def (awk-builtin-atan2 env args)
+  (make-awk-number (atan (awk->number (car args))
+                         (awk->number (cadr args)))))
 
-;;; exp(x)
-(def (awk-builtin-exp rt args)
-  (match args
-    ([x] (make-awk-number (exp (awk->number x))))
-    (_ (error "awk: exp: wrong number of arguments"))))
+(def (awk-builtin-exp env args)
+  (make-awk-number (exp (awk->number (car args)))))
 
-;;; log(x)
-(def (awk-builtin-log rt args)
-  (match args
-    ([x] (make-awk-number (log (awk->number x))))
-    (_ (error "awk: log: wrong number of arguments"))))
+(def (awk-builtin-log env args)
+  (make-awk-number (log (awk->number (car args)))))
 
-;;; sqrt(x)
-(def (awk-builtin-sqrt rt args)
-  (match args
-    ([x] (make-awk-number (sqrt (awk->number x))))
-    (_ (error "awk: sqrt: wrong number of arguments"))))
+(def (awk-builtin-sqrt env args)
+  (make-awk-number (sqrt (awk->number (car args)))))
 
-;;; int(x)
-(def (awk-builtin-int rt args)
-  (match args
-    ([x]
-     (let ((n (awk->number x)))
-       (make-awk-number (inexact->exact (truncate n)))))
-    (_ (error "awk: int: wrong number of arguments"))))
+(def (awk-builtin-int env args)
+  (make-awk-number (truncate (awk->number (car args)))))
 
-;;; rand()
-(def *awk-rng-state* #f)
+;;; rand() / srand()
 
-(def (awk-builtin-rand rt args)
-  (match args
-    ([]
-     (unless *awk-rng-state*
-       (set! *awk-rng-state* (make-random-source)))
-     (make-awk-number ((random-source-make-reals *awk-rng-state*))))
-    (_ (error "awk: rand: wrong number of arguments"))))
+(def *awk-rand-seed* 1)
+(def *awk-rand-state* #f)
 
-;;; srand([x])
-(def (awk-builtin-srand rt args)
-  (match args
-    ([]
-     (let ((old-seed (if *awk-rng-state*
-                        (random-source-state-ref *awk-rng-state*)
-                        0)))
-       (set! *awk-rng-state* (make-random-source))
-       (random-source-randomize! *awk-rng-state*)
-       (make-awk-number old-seed)))
-    ([x]
-     (let ((old-seed (if *awk-rng-state*
-                        (random-source-state-ref *awk-rng-state*)
-                        0)))
-       (set! *awk-rng-state* (make-random-source))
-       (random-source-pseudo-randomize! *awk-rng-state*
-                                         (inexact->exact (awk->number x))
-                                         0)
-       (make-awk-number old-seed)))
-    (_ (error "awk: srand: wrong number of arguments"))))
+(def (ensure-rand-state!)
+  (unless *awk-rand-state*
+    (set! *awk-rand-state* (make-random-source))
+    (random-source-pseudo-randomize! *awk-rand-state* *awk-rand-seed* 0)))
 
-;;; Bitwise functions (gawk extension)
+(def (awk-builtin-rand env args)
+  (ensure-rand-state!)
+  (make-awk-number ((random-source-make-reals *awk-rand-state*))))
 
-(def (awk-builtin-and rt args)
-  (match args
-    ([x y]
-     (make-awk-number (logand (inexact->exact (awk->number x))
-                              (inexact->exact (awk->number y)))))
-    (_ (error "awk: and: wrong number of arguments"))))
-
-(def (awk-builtin-or rt args)
-  (match args
-    ([x y]
-     (make-awk-number (logior (inexact->exact (awk->number x))
-                              (inexact->exact (awk->number y)))))
-    (_ (error "awk: or: wrong number of arguments"))))
-
-(def (awk-builtin-xor rt args)
-  (match args
-    ([x y]
-     (make-awk-number (logxor (inexact->exact (awk->number x))
-                              (inexact->exact (awk->number y)))))
-    (_ (error "awk: xor: wrong number of arguments"))))
-
-(def (awk-builtin-compl rt args)
-  (match args
-    ([x]
-     (make-awk-number (lognot (inexact->exact (awk->number x)))))
-    (_ (error "awk: compl: wrong number of arguments"))))
-
-(def (awk-builtin-lshift rt args)
-  (match args
-    ([x n]
-     (make-awk-number (arithmetic-shift (inexact->exact (awk->number x))
-                                         (inexact->exact (awk->number n)))))
-    (_ (error "awk: lshift: wrong number of arguments"))))
-
-(def (awk-builtin-rshift rt args)
-  (match args
-    ([x n]
-     (make-awk-number (arithmetic-shift (inexact->exact (awk->number x))
-                                         (- (inexact->exact (awk->number n))))))
-    (_ (error "awk: rshift: wrong number of arguments"))))
+(def (awk-builtin-srand env args)
+  (let ((old-seed *awk-rand-seed*))
+    (if (null? args)
+      (begin
+        (set! *awk-rand-seed* (inexact->exact (floor (time->seconds (current-time)))))
+        (set! *awk-rand-state* (make-random-source))
+        (random-source-pseudo-randomize! *awk-rand-state* *awk-rand-seed* 0)
+        (make-awk-number old-seed))
+      (begin
+        (set! *awk-rand-seed* (inexact->exact (floor (awk->number (car args)))))
+        (set! *awk-rand-state* (make-random-source))
+        (random-source-pseudo-randomize! *awk-rand-state* *awk-rand-seed* 0)
+        (make-awk-number old-seed)))))

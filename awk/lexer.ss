@@ -1,186 +1,155 @@
 ;; -*- Gerbil -*-
 ;;;; AWK Lexer
-;;
-;; Tokenizes AWK source code. Handles:
-;; - Keywords
-;; - Operators (including multi-char like +=, &&, etc.)
-;; - Numbers (decimal, hex, octal)
-;; - Strings (with escape sequences)
-;; - Regex literals (/pattern/)
-;; - Regex vs division disambiguation
 
 (export #t)
 
-;;; Token types
+;;; Token
 
 (defstruct tok
-  (type        ; symbol
-   value       ; token value (string, number, etc.)
-   line        ; line number
-   column)     ; column number
+  (type value line column)
   transparent: #t)
 
 ;;; Lexer state
 
 (defstruct lexer
-  (input       ; string
-   pos         ; current position
-   len         ; input length
-   line        ; current line
-   column      ; current column
-   peeked      ; peeked token or #f
-   last-token) ; last token returned (for regex/division disambiguation)
+  (input pos len line column peeked last-type)
   transparent: #t)
 
-(def (make-lexer-from-string input)
+(def (make-awk-lexer input)
   (make-lexer input 0 (string-length input) 1 1 #f #f))
 
 ;;; Keywords
 
 (def +keywords+
-  '(BEGIN END BEGINFILE ENDFILE
-    if else while for do break continue
+  '(BEGIN END if else while for do break continue
     function return delete exit next nextfile
-    switch case default
     print printf getline in))
-
-;;; Token type predicates
-
-(def (value-producing-token? tok)
-  "Check if token can precede division (vs regex)"
-  (and tok
-       (memq (tok-type tok)
-             '(NUMBER STRING NAME REGEX RPAREN RBRACKET DOLLAR))))
-
-(def (keyword? name)
-  (memq name +keywords+))
 
 ;;; Character utilities
 
-(def (lexer-char lex)
-  (let ((pos (lexer-pos lex)))
-    (if (fx>= pos (lexer-len lex))
-      #f
-      (string-ref (lexer-input lex) pos))))
+(def (lex-ch lex)
+  (if (>= (lexer-pos lex) (lexer-len lex))
+    #f
+    (string-ref (lexer-input lex) (lexer-pos lex))))
 
-(def (lexer-char-at lex offset)
-  (let ((pos (fx+ (lexer-pos lex) offset)))
-    (if (fx>= pos (lexer-len lex))
+(def (lex-ch+ lex offset)
+  (let ((p (+ (lexer-pos lex) offset)))
+    (if (>= p (lexer-len lex))
       #f
-      (string-ref (lexer-input lex) pos))))
+      (string-ref (lexer-input lex) p))))
 
-(def (lexer-advance! lex)
-  (let ((c (lexer-char lex)))
+(def (lex-advance! lex)
+  (let ((c (lex-ch lex)))
     (when c
-      (set! (lexer-pos lex) (fx+ (lexer-pos lex) 1))
+      (set! (lexer-pos lex) (+ (lexer-pos lex) 1))
       (if (char=? c #\newline)
-        (begin
-          (set! (lexer-line lex) (fx+ (lexer-line lex) 1))
-          (set! (lexer-column lex) 1))
-        (set! (lexer-column lex) (fx+ (lexer-column lex) 1))))
+        (begin (set! (lexer-line lex) (+ (lexer-line lex) 1))
+               (set! (lexer-column lex) 1))
+        (set! (lexer-column lex) (+ (lexer-column lex) 1))))
     c))
 
-(def (lexer-skip-whitespace! lex)
-  "Skip whitespace but NOT newlines (newlines are significant in AWK)"
+(def (lex-skip-ws! lex)
+  "Skip whitespace except newlines"
   (let loop ()
-    (let ((c (lexer-char lex)))
-      (when (and c (char? c) (char-whitespace? c) (not (char=? c #\newline)))
-        (lexer-advance! lex)
-        (loop)))))
+    (let ((c (lex-ch lex)))
+      (when (and c (char-whitespace? c) (not (char=? c #\newline)))
+        (lex-advance! lex) (loop)))))
 
-(def (lexer-skip-comment! lex)
-  "Skip from # to end of line"
+(def (lex-skip-line! lex)
+  "Skip to end of line (for comments)"
   (let loop ()
-    (let ((c (lexer-char lex)))
+    (let ((c (lex-ch lex)))
       (when (and c (not (char=? c #\newline)))
-        (lexer-advance! lex)
-        (loop)))))
+        (lex-advance! lex) (loop)))))
 
-(def (lexer-skip-whitespace-and-comments! lex (skip-newlines? #f))
-  "Skip whitespace and comments. If skip-newlines?, skip newlines too."
+(def (lex-skip! lex)
+  "Skip whitespace and comments (not newlines unless after backslash)"
   (let loop ()
-    (let ((c (lexer-char lex)))
+    (lex-skip-ws! lex)
+    (let ((c (lex-ch lex)))
       (cond
-        ((not c) #f)
-        ((and (char-whitespace? c)
-              (or skip-newlines? (not (char=? c #\newline))))
-         (lexer-advance! lex)
-         (loop))
-        ((char=? c #\#)
-         (lexer-skip-comment! lex)
-         (loop))
-        (else #f)))))
+        ((and c (char=? c #\#))
+         (lex-skip-line! lex) (loop))
+        ((and c (char=? c #\\) (let ((n (lex-ch+ lex 1))) (and n (char=? n #\newline))))
+         ;; Line continuation
+         (lex-advance! lex) (lex-advance! lex) (loop))
+        (else (void))))))
 
-;;; Token reading
+;;; Token reading helpers
+
+(def (value-token? type)
+  "Can this token type precede division (vs regex)?"
+  (and type (memq type '(NUMBER STRING NAME RPAREN RBRACKET DOLLAR PLUSPLUS MINUSMINUS))))
+
+(def (make-tok! lex type value)
+  (let ((t (make-tok type value (lexer-line lex) (lexer-column lex))))
+    (set! (lexer-last-type lex) type)
+    t))
+
+;;; Number reading
 
 (def (read-number lex)
-  "Read a number literal (decimal, hex, or octal)"
-  (let* ((start-pos (lexer-pos lex))
-         (start-line (lexer-line lex))
-         (start-col (lexer-column lex))
-         (c (lexer-char lex)))
-    (cond
-      ;; Hex number: 0x...
-      ((and (char=? c #\0)
-            (let ((next (lexer-char-at lex 1)))
-              (and next (char-ci=? next #\x))))
-       (lexer-advance! lex) ; 0
-       (lexer-advance! lex) ; x
-       (let loop ((chars '(#\x #\0)))
-         (let ((c (lexer-char lex)))
-           (if (and c (or (char-numeric? c)
-                          (and (char-ci>=? c #\a) (char-ci<=? c #\f))))
-             (begin (lexer-advance! lex) (loop (cons c chars)))
-             (let ((hex-str (list->string (reverse chars))))
-               (make-tok 'NUMBER (string->number hex-str 16) start-line start-col))))))
+  (let ((line (lexer-line lex))
+        (col (lexer-column lex))
+        (c (lex-ch lex)))
+    ;; Hex: 0x...
+    (if (and (char=? c #\0) (let ((n (lex-ch+ lex 1))) (and n (char-ci=? n #\x))))
+      (begin (lex-advance! lex) (lex-advance! lex)
+        (let loop ((chars '()))
+          (let ((c (lex-ch lex)))
+            (if (and c (or (char-numeric? c) (and (char-ci>=? c #\a) (char-ci<=? c #\f))))
+              (begin (lex-advance! lex) (loop (cons c chars)))
+              (let* ((s (list->string (reverse chars)))
+                     (n (or (string->number (string-append "0x" s) 16) 0)))
+                (set! (lexer-last-type lex) 'NUMBER)
+                (make-tok 'NUMBER n line col))))))
       ;; Regular number
-      (else
-       (let loop ((chars '())
-                  (has-dot? #f)
-                  (has-exp? #f))
-         (let ((c (lexer-char lex)))
-           (cond
-             ((and c (char-numeric? c))
-              (lexer-advance! lex)
-              (loop (cons c chars) has-dot? has-exp?))
-             ((and c (char=? c #\.) (not has-dot?) (not has-exp?))
-              (lexer-advance! lex)
-              (loop (cons c chars) #t has-exp?))
-             ((and c (or (char-ci=? c #\e)) (not has-exp?))
-              (lexer-advance! lex)
-              (let ((c (lexer-char lex)))
-                (if (and c (or (char=? c #\+) (char=? c #\-)))
-                  (begin
-                    (lexer-advance! lex)
-                    (loop (cons c (cons #\e chars)) has-dot? #t))
-                  (loop (cons #\e chars) has-dot? #t))))
-             (else
-              (let ((num-str (list->string (reverse chars))))
-                (make-tok 'NUMBER (string->number num-str) start-line start-col))))))))))
+      (let loop ((chars '()) (has-dot? #f) (has-exp? #f))
+        (let ((c (lex-ch lex)))
+          (cond
+            ((and c (char-numeric? c))
+             (lex-advance! lex) (loop (cons c chars) has-dot? has-exp?))
+            ((and c (char=? c #\.) (not has-dot?) (not has-exp?))
+             (lex-advance! lex) (loop (cons c chars) #t has-exp?))
+            ((and c (char-ci=? c #\e) (not has-exp?))
+             (lex-advance! lex)
+             (let ((c2 (lex-ch lex)))
+               (if (and c2 (or (char=? c2 #\+) (char=? c2 #\-)))
+                 (begin (lex-advance! lex)
+                        (loop (cons c2 (cons #\e chars)) has-dot? #t))
+                 (loop (cons #\e chars) has-dot? #t))))
+            (else
+             (let* ((s (list->string (reverse chars)))
+                    (n (or (string->number s) 0)))
+               (set! (lexer-last-type lex) 'NUMBER)
+               (make-tok 'NUMBER n line col)))))))))
+
+;;; String reading
 
 (def (read-string lex)
-  "Read a double-quoted string literal"
-  (let ((start-line (lexer-line lex))
-        (start-col (lexer-column lex)))
-    (lexer-advance! lex) ; opening "
+  (let ((line (lexer-line lex))
+        (col (lexer-column lex)))
+    (lex-advance! lex) ;; skip opening "
     (let loop ((chars '()))
-      (let ((c (lexer-char lex)))
+      (let ((c (lex-ch lex)))
         (cond
-          ((not c) (error "unterminated string" start-line))
+          ((not c) (error "unterminated string" line))
           ((char=? c #\")
-           (lexer-advance! lex)
-           (make-tok 'STRING (list->string (reverse chars)) start-line start-col))
+           (lex-advance! lex)
+           (set! (lexer-last-type lex) 'STRING)
+           (make-tok 'STRING (list->string (reverse chars)) line col))
           ((char=? c #\\)
-           (lexer-advance! lex)
-           (let ((escaped (lexer-char lex)))
-             (lexer-advance! lex)
-             (loop (cons (escape-char escaped) chars))))
+           (lex-advance! lex)
+           (let ((e (lex-ch lex)))
+             (if e
+               (begin (lex-advance! lex)
+                      (loop (cons (escape-char e) chars)))
+               (error "unterminated string escape" line))))
           (else
-           (lexer-advance! lex)
+           (lex-advance! lex)
            (loop (cons c chars))))))))
 
 (def (escape-char c)
-  "Convert escape sequence character"
   (case c
     ((#\a) #\alarm)
     ((#\b) #\backspace)
@@ -189,282 +158,201 @@
     ((#\r) #\return)
     ((#\t) #\tab)
     ((#\v) #\vtab)
-    ((#\") #\")
     ((#\\) #\\)
+    ((#\") #\")
     ((#\/) #\/)
-    (else c)))
+    (else
+     ;; Octal escape \NNN
+     (if (and (char>=? c #\0) (char<=? c #\7))
+       (integer->char (- (char->integer c) (char->integer #\0)))
+       c))))
+
+;;; Regex reading
 
 (def (read-regex lex)
-  "Read a regex literal /pattern/"
-  (let ((start-line (lexer-line lex))
-        (start-col (lexer-column lex)))
-    (lexer-advance! lex) ; opening /
+  (let ((line (lexer-line lex))
+        (col (lexer-column lex)))
+    (lex-advance! lex) ;; skip opening /
     (let loop ((chars '()))
-      (let ((c (lexer-char lex)))
+      (let ((c (lex-ch lex)))
         (cond
-          ((not c) (error "unterminated regex" start-line))
+          ((not c) (error "unterminated regex" line))
           ((char=? c #\/)
-           (lexer-advance! lex)
-           (make-tok 'REGEX (list->string (reverse chars)) start-line start-col))
+           (lex-advance! lex)
+           (set! (lexer-last-type lex) 'REGEX)
+           (make-tok 'REGEX (list->string (reverse chars)) line col))
           ((char=? c #\\)
-           (lexer-advance! lex)
-           (let ((escaped (lexer-char lex)))
-             (lexer-advance! lex)
-             (loop (cons escaped (cons c chars)))))
+           (lex-advance! lex)
+           (let ((e (lex-ch lex)))
+             (when e (lex-advance! lex))
+             (loop (cons (or e #\\) (cons #\\ chars)))))
           (else
-           (lexer-advance! lex)
+           (lex-advance! lex)
            (loop (cons c chars))))))))
 
+;;; Name reading
+
 (def (read-name lex)
-  "Read an identifier (variable/function name)"
-  (let ((start-line (lexer-line lex))
-        (start-col (lexer-column lex)))
+  (let ((line (lexer-line lex))
+        (col (lexer-column lex)))
     (let loop ((chars '()))
-      (let ((c (lexer-char lex)))
-        (if (and c (or (char-alphabetic? c)
-                       (char-numeric? c)
-                       (char=? c #\_)))
-          (begin
-            (lexer-advance! lex)
-            (loop (cons c chars)))
+      (let ((c (lex-ch lex)))
+        (if (and c (or (char-alphabetic? c) (char-numeric? c) (char=? c #\_)))
+          (begin (lex-advance! lex) (loop (cons c chars)))
           (let ((name (string->symbol (list->string (reverse chars)))))
-            (if (keyword? name)
-              (make-tok name name start-line start-col)
-              (make-tok 'NAME name start-line start-col))))))))
+            (if (memq name +keywords+)
+              (begin (set! (lexer-last-type lex) name)
+                     (make-tok name name line col))
+              (begin (set! (lexer-last-type lex) 'NAME)
+                     (make-tok 'NAME name line col)))))))))
 
-;;; Main lexer functions
+;;; Main lexer
 
-(def (lexer-next-token! lex)
-  "Get the next token from the lexer"
-  (when (lexer-peeked lex)
-    (set! (lexer-peeked lex) #f)
-    (let ((tok (lexer-peeked lex)))
-      (when tok (set! (lexer-last-token lex) tok))
-      (return tok)))
-  
-  (lexer-skip-whitespace-and-comments! lex)
-  
-  (let* ((c (lexer-char lex))
-         (line (lexer-line lex))
-         (col (lexer-column lex)))
-    (cond
-      ((not c) (make-tok 'EOF #f line col))
-      
-      ;; Newline (significant in AWK)
-      ((char=? c #\newline)
-       (lexer-advance! lex)
-       (make-tok 'NEWLINE #f line col))
-      
-      ;; Number
-      ((char-numeric? c)
-       (let ((tok (read-number lex)))
-         (set! (lexer-last-token lex) tok)
-         tok))
-      
-      ;; String
-      ((char=? c #\")
-       (let ((tok (read-string lex)))
-         (set! (lexer-last-token lex) tok)
-         tok))
-      
-      ;; Name or keyword
-      ((or (char-alphabetic? c) (char=? c #\_))
-       (let ((tok (read-name lex)))
-         (set! (lexer-last-token lex) tok)
-         tok))
-      
-      ;; @directive (@include, @load, @namespace, @/regex/)
-      ((char=? c #\@)
-       (lexer-advance! lex)
-       (let ((next (lexer-char lex)))
-         (cond
-           ((char=? next #\/)
-            (let ((tok (read-regex lex)))
-              (set! (tok-type tok) 'TYPED-REGEX)
-              (set! (lexer-last-token lex) tok)
-              tok))
-           ((or (char-alphabetic? next) (char=? next #\_))
-            (let ((tok (read-name lex)))
-              (set! (tok-type tok) 'AT-DIRECTIVE)
-              (set! (lexer-last-token lex) tok)
-              tok))
-           (else (error "invalid @ directive" line)))))
-      
-      ;; $ (field reference)
-      ((char=? c #\$)
-       (lexer-advance! lex)
-       (let ((tok (make-tok 'DOLLAR #f line col)))
-         (set! (lexer-last-token lex) tok)
-         tok))
-      
-      ;; Operators
-      ((char=? c #\+)
-       (lexer-advance! lex)
-       (if (char=? (lexer-char lex) #\+)
-         (begin (lexer-advance! lex)
-                (make-tok-and-save lex 'PLUSPLUS "++" line col))
-         (if (char=? (lexer-char lex) #\=)
-           (begin (lexer-advance! lex)
-                  (make-tok-and-save lex 'PLUSEQ "+=" line col))
-           (make-tok-and-save lex 'PLUS "+" line col))))
-      
-      ((char=? c #\-)
-       (lexer-advance! lex)
-       (if (char=? (lexer-char lex) #\-)
-         (begin (lexer-advance! lex)
-                (make-tok-and-save lex 'MINUSMINUS "--" line col))
-         (if (char=? (lexer-char lex) #\=)
-           (begin (lexer-advance! lex)
-                  (make-tok-and-save lex 'MINUSEQ "-=" line col))
-           (make-tok-and-save lex 'MINUS "-" line col))))
-      
-      ((char=? c #\*)
-       (lexer-advance! lex)
-       (if (char=? (lexer-char lex) #\*)
-         (begin (lexer-advance! lex)
-                (make-tok-and-save lex 'STARSTAR "**" line col))
-         (if (char=? (lexer-char lex) #\=)
-           (begin (lexer-advance! lex)
-                  (make-tok-and-save lex 'STAREQ "*=" line col))
-           (make-tok-and-save lex 'STAR "*" line col))))
-      
-      ((char=? c #\/)
-       ;; CRITICAL: Regex vs division disambiguation
-       ;; After a value-producing token, / is division
-       ;; Otherwise, / starts a regex
-       (if (value-producing-token? (lexer-last-token lex))
-         (begin
-           (lexer-advance! lex)
-           (if (char=? (lexer-char lex) #\=)
-             (begin (lexer-advance! lex)
-                    (make-tok-and-save lex 'SLASHEQ "/=" line col))
-             (make-tok-and-save lex 'SLASH "/" line col)))
-         (let ((tok (read-regex lex)))
-           (set! (lexer-last-token lex) tok)
-           tok)))
-      
-      ((char=? c #\%)
-       (lexer-advance! lex)
-       (if (char=? (lexer-char lex) #\=)
-         (begin (lexer-advance! lex)
-                (make-tok-and-save lex 'PERCENTEQ "%=" line col))
-         (make-tok-and-save lex 'PERCENT "%" line col)))
-      
-      ((char=? c #\^)
-       (lexer-advance! lex)
-       (if (char=? (lexer-char lex) #\=)
-         (begin (lexer-advance! lex)
-                (make-tok-and-save lex 'CARETEQ "^=" line col))
-         (make-tok-and-save lex 'CARET "^" line col)))
-      
-      ((char=? c #\<)
-       (lexer-advance! lex)
-       (cond
-         ((char=? (lexer-char lex) #\<) (lexer-advance! lex) (make-tok-and-save lex 'LSHIFT "<<" line col))
-         ((char=? (lexer-char lex) #\=) (lexer-advance! lex) (make-tok-and-save lex 'LE "<=" line col))
-         (else (make-tok-and-save lex 'LT "<" line col))))
-      
-      ((char=? c #\>)
-       (lexer-advance! lex)
-       (cond
-         ((char=? (lexer-char lex) #\>) (lexer-advance! lex) (make-tok-and-save lex 'RSHIFT ">>" line col))
-         ((char=? (lexer-char lex) #\=) (lexer-advance! lex) (make-tok-and-save lex 'GE ">=" line col))
-         (else (make-tok-and-save lex 'GT ">" line col))))
-      
-      ((char=? c #\=)
-       (lexer-advance! lex)
-       (if (char=? (lexer-char lex) #\=)
-         (begin (lexer-advance! lex)
-                (make-tok-and-save lex 'EQ "==" line col))
-         (make-tok-and-save lex 'ASSIGN "=" line col)))
-      
-      ((char=? c #\!)
-       (lexer-advance! lex)
-       (cond
-         ((char=? (lexer-char lex) #\=) (lexer-advance! lex) (make-tok-and-save lex 'NE "!=" line col))
-         ((char=? (lexer-char lex) #\~) (lexer-advance! lex) (make-tok-and-save lex 'NOMATCH "!~" line col))
-         (else (make-tok-and-save lex 'NOT "!" line col))))
-      
-      ((char=? c #\~)
-       (lexer-advance! lex)
-       (make-tok-and-save lex 'MATCH "~" line col))
-      
-      ((char=? c #\&)
-       (lexer-advance! lex)
-       (if (char=? (lexer-char lex) #\&)
-         (begin (lexer-advance! lex)
-                (make-tok-and-save lex 'AND "&&" line col))
-         (error "unexpected &" line)))
-      
-      ((char=? c #\|)
-       (lexer-advance! lex)
-       (cond
-         ((char=? (lexer-char lex) #\|) (lexer-advance! lex) (make-tok-and-save lex 'OR "||" line col))
-         ((char=? (lexer-char lex) #\&) (lexer-advance! lex) (make-tok-and-save lex 'PIPEAMP "|&" line col))
-         (else (make-tok-and-save lex 'PIPE "|" line col))))
-      
-      ((char=? c #\?)
-       (lexer-advance! lex)
-       (make-tok-and-save lex 'QUESTION "?" line col))
-      
-      ((char=? c #\:)
-       (lexer-advance! lex)
-       (make-tok-and-save lex 'COLON ":" line col))
-      
-      ((char=? c #\,)
-       (lexer-advance! lex)
-       (make-tok-and-save lex 'COMMA "," line col))
-      
-      ((char=? c #\;)
-       (lexer-advance! lex)
-       (make-tok-and-save lex 'SEMI ";" line col))
-      
-      ((char=? c #\()
-       (lexer-advance! lex)
-       (make-tok-and-save lex 'LPAREN "(" line col))
-      
-      ((char=? c #\))
-       (lexer-advance! lex)
-       (let ((tok (make-tok 'RPAREN ")" line col)))
-         (set! (lexer-last-token lex) tok)
-         tok))
-      
-      ((char=? c #\[)
-       (lexer-advance! lex)
-       (make-tok-and-save lex 'LBRACKET "[" line col))
-      
-      ((char=? c #\])
-       (lexer-advance! lex)
-       (let ((tok (make-tok 'RBRACKET "]" line col)))
-         (set! (lexer-last-token lex) tok)
-         tok))
-      
-      ((char=? c #\{)
-       (lexer-advance! lex)
-       (make-tok-and-save lex 'LBRACE "{" line col))
-      
-      ((char=? c #\})
-       (lexer-advance! lex)
-       (make-tok-and-save lex 'RBRACE "}" line col))
-      
-      (else
-       (error "unexpected character" c line col)))))
+(def (lex-next! lex)
+  "Get next token"
+  (if (lexer-peeked lex)
+    (let ((t (lexer-peeked lex)))
+      (set! (lexer-peeked lex) #f)
+      (set! (lexer-last-type lex) (tok-type t))
+      t)
+    (begin
+      (lex-skip! lex)
+      (let ((c (lex-ch lex))
+            (line (lexer-line lex))
+            (col (lexer-column lex)))
+        (cond
+          ((not c) (make-tok 'EOF #f line col))
+          ((char=? c #\newline)
+           (lex-advance! lex)
+           (make-tok 'NEWLINE #f line col))
+          ((char-numeric? c) (read-number lex))
+          ((char=? c #\.)
+           ;; Could be .5 style number
+           (let ((n (lex-ch+ lex 1)))
+             (if (and n (char-numeric? n))
+               (read-number lex)
+               (begin (lex-advance! lex) (make-tok! lex 'DOT ".")))))
+          ((char=? c #\") (read-string lex))
+          ((or (char-alphabetic? c) (char=? c #\_)) (read-name lex))
+          ((char=? c #\$)
+           (lex-advance! lex) (make-tok! lex 'DOLLAR #f))
+          ((char=? c #\()
+           (lex-advance! lex) (make-tok! lex 'LPAREN "("))
+          ((char=? c #\))
+           (lex-advance! lex) (make-tok! lex 'RPAREN ")"))
+          ((char=? c #\[)
+           (lex-advance! lex) (make-tok! lex 'LBRACKET "["))
+          ((char=? c #\])
+           (lex-advance! lex) (make-tok! lex 'RBRACKET "]"))
+          ((char=? c #\{)
+           (lex-advance! lex) (make-tok! lex 'LBRACE "{"))
+          ((char=? c #\})
+           (lex-advance! lex) (make-tok! lex 'RBRACE "}"))
+          ((char=? c #\;)
+           (lex-advance! lex) (make-tok! lex 'SEMI ";"))
+          ((char=? c #\,)
+           (lex-advance! lex) (make-tok! lex 'COMMA ","))
+          ((char=? c #\?)
+           (lex-advance! lex) (make-tok! lex 'QUESTION "?"))
+          ((char=? c #\:)
+           (lex-advance! lex) (make-tok! lex 'COLON ":"))
+          ((char=? c #\+)
+           (lex-advance! lex)
+           (let ((n (lex-ch lex)))
+             (cond
+               ((and n (char=? n #\+)) (lex-advance! lex) (make-tok! lex 'PLUSPLUS "++"))
+               ((and n (char=? n #\=)) (lex-advance! lex) (make-tok! lex 'PLUSEQ "+="))
+               (else (make-tok! lex 'PLUS "+")))))
+          ((char=? c #\-)
+           (lex-advance! lex)
+           (let ((n (lex-ch lex)))
+             (cond
+               ((and n (char=? n #\-)) (lex-advance! lex) (make-tok! lex 'MINUSMINUS "--"))
+               ((and n (char=? n #\=)) (lex-advance! lex) (make-tok! lex 'MINUSEQ "-="))
+               (else (make-tok! lex 'MINUS "-")))))
+          ((char=? c #\*)
+           (lex-advance! lex)
+           (let ((n (lex-ch lex)))
+             (cond
+               ((and n (char=? n #\*)) (lex-advance! lex) (make-tok! lex 'STARSTAR "**"))
+               ((and n (char=? n #\=)) (lex-advance! lex) (make-tok! lex 'STAREQ "*="))
+               (else (make-tok! lex 'STAR "*")))))
+          ((char=? c #\/)
+           (if (value-token? (lexer-last-type lex))
+             ;; Division
+             (begin
+               (lex-advance! lex)
+               (let ((n (lex-ch lex)))
+                 (if (and n (char=? n #\=))
+                   (begin (lex-advance! lex) (make-tok! lex 'SLASHEQ "/="))
+                   (make-tok! lex 'SLASH "/"))))
+             ;; Regex
+             (read-regex lex)))
+          ((char=? c #\%)
+           (lex-advance! lex)
+           (let ((n (lex-ch lex)))
+             (if (and n (char=? n #\=))
+               (begin (lex-advance! lex) (make-tok! lex 'PERCENTEQ "%="))
+               (make-tok! lex 'PERCENT "%"))))
+          ((char=? c #\^)
+           (lex-advance! lex)
+           (let ((n (lex-ch lex)))
+             (if (and n (char=? n #\=))
+               (begin (lex-advance! lex) (make-tok! lex 'CARETEQ "^="))
+               (make-tok! lex 'CARET "^"))))
+          ((char=? c #\<)
+           (lex-advance! lex)
+           (let ((n (lex-ch lex)))
+             (if (and n (char=? n #\=))
+               (begin (lex-advance! lex) (make-tok! lex 'LE "<="))
+               (make-tok! lex 'LT "<"))))
+          ((char=? c #\>)
+           (lex-advance! lex)
+           (let ((n (lex-ch lex)))
+             (cond
+               ((and n (char=? n #\>)) (lex-advance! lex) (make-tok! lex 'APPEND ">>"))
+               ((and n (char=? n #\=)) (lex-advance! lex) (make-tok! lex 'GE ">="))
+               (else (make-tok! lex 'GT ">")))))
+          ((char=? c #\=)
+           (lex-advance! lex)
+           (let ((n (lex-ch lex)))
+             (if (and n (char=? n #\=))
+               (begin (lex-advance! lex) (make-tok! lex 'EQ "=="))
+               (make-tok! lex 'ASSIGN "="))))
+          ((char=? c #\!)
+           (lex-advance! lex)
+           (let ((n (lex-ch lex)))
+             (cond
+               ((and n (char=? n #\=)) (lex-advance! lex) (make-tok! lex 'NE "!="))
+               ((and n (char=? n #\~)) (lex-advance! lex) (make-tok! lex 'NOMATCH "!~"))
+               (else (make-tok! lex 'NOT "!")))))
+          ((char=? c #\~)
+           (lex-advance! lex) (make-tok! lex 'MATCH "~"))
+          ((char=? c #\&)
+           (lex-advance! lex)
+           (let ((n (lex-ch lex)))
+             (if (and n (char=? n #\&))
+               (begin (lex-advance! lex) (make-tok! lex 'AND "&&"))
+               (error "unexpected &" line col))))
+          ((char=? c #\|)
+           (lex-advance! lex)
+           (let ((n (lex-ch lex)))
+             (if (and n (char=? n #\|))
+               (begin (lex-advance! lex) (make-tok! lex 'OR "||"))
+               (make-tok! lex 'PIPE "|"))))
+          (else
+           (error "unexpected character" c line col)))))))
 
-(def (make-tok-and-save lex type value line col)
-  (let ((tok (make-tok type value line col)))
-    (set! (lexer-last-token lex) tok)
-    tok))
-
-(def (lexer-peek-token! lex)
-  "Peek at the next token without consuming it"
+(def (lex-peek! lex)
+  "Peek at next token"
   (unless (lexer-peeked lex)
-    (set! (lexer-peeked lex) (lexer-next-token! lex)))
+    (set! (lexer-peeked lex) (lex-next! lex)))
   (lexer-peeked lex))
 
-(def (lexer-skip-newlines! lex)
-  "Skip any pending newlines"
+(def (lex-skip-newlines! lex)
+  "Skip any newline tokens"
   (let loop ()
-    (let ((tok (lexer-peek-token! lex)))
-      (when (and tok (eq? (tok-type tok) 'NEWLINE))
-        (lexer-next-token! lex)
+    (let ((t (lex-peek! lex)))
+      (when (eq? (tok-type t) 'NEWLINE)
+        (lex-next! lex)
         (loop)))))

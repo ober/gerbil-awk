@@ -1,794 +1,604 @@
 ;; -*- Gerbil -*-
-;;;; AWK Parser
-;;
-;; Recursive descent parser for AWK. Builds AST from lexer tokens.
+;;;; AWK Parser — recursive descent
 
 (import ./lexer ./ast)
 (export #t)
 
 ;;; Parser state
 
-(defstruct parser-state
-  (lexer        ; lexer instance
-   functions    ; hash-table of function definitions
-   rules        ; list of rules
-   includes     ; list of @include files
-   loads        ; list of @load extensions
-   namespace    ; current namespace
-   errors)      ; list of error messages
+(defstruct pstate
+  (lex functions rules)
   transparent: #t)
 
-(def (make-parser-from-string input)
-  (make-parser-state
-   (make-lexer-from-string input)
-   (make-hash-table)
-   '()
-   '()
-   '()
-   "awk"
-   '()))
+(def (make-parser input)
+  (make-pstate (make-awk-lexer input) (make-hash-table) '()))
 
-;;; Token utilities
+;;; Token helpers
 
-(def (parser-peek ps)
-  (lexer-peek-token! (parser-state-lexer ps)))
+(def (peek ps) (lex-peek! (pstate-lex ps)))
+(def (advance! ps) (lex-next! (pstate-lex ps)))
+(def (skip-nl! ps) (lex-skip-newlines! (pstate-lex ps)))
 
-(def (parser-advance! ps)
-  (lexer-next-token! (parser-state-lexer ps)))
+(def (check? ps type)
+  (eq? (tok-type (peek ps)) type))
 
-(def (parser-check ps type)
-  (let ((tok (parser-peek ps)))
-    (and tok (eq? (tok-type tok) type))))
+(def (match! ps type)
+  (if (check? ps type) (advance! ps) #f))
 
-(def (parser-match! ps type)
-  (when (parser-check ps type)
-    (parser-advance! ps)))
+(def (expect! ps type)
+  (if (check? ps type)
+    (advance! ps)
+    (let ((t (peek ps)))
+      (error (string-append "expected " (symbol->string type)
+                            " got " (symbol->string (tok-type t))
+                            " at line " (number->string (tok-line t)))))))
 
-(def (parser-expect! ps type (msg #f))
-  (let ((tok (parser-peek ps)))
-    (if (and tok (eq? (tok-type tok) type))
-      (parser-advance! ps)
-      (let ((actual (if tok (tok-type tok) 'EOF)))
-        (error (or msg (format "expected ~a, got ~a at line ~a" type actual (if tok (tok-line tok) 0))))))))
+(def (term! ps)
+  "Consume a statement terminator (newline, semicolon, or peek at } / EOF)"
+  (cond
+    ((check? ps 'NEWLINE) (advance! ps))
+    ((check? ps 'SEMI) (advance! ps))
+    ((check? ps 'RBRACE) (void))
+    ((check? ps 'EOF) (void))
+    (else (void))))
 
-(def (parser-error! ps msg)
-  (let ((tok (parser-peek ps)))
-    (set! (parser-state-errors ps)
-          (cons (list msg (if tok (tok-line tok) 0))
-                (parser-state-errors ps)))))
+;;; Main parse
 
-;;; Main parse function
+(def (parse-awk-string input)
+  (let ((ps (make-parser input)))
+    (parse-program ps)))
 
 (def (parse-program ps)
-  "Parse an AWK program"
   (let loop ()
-    (lexer-skip-newlines! (parser-state-lexer ps))
-    (unless (parser-check ps 'EOF)
+    (skip-nl! ps)
+    (unless (check? ps 'EOF)
       (parse-item ps)
       (loop)))
   (make-awk-program
-   (reverse (parser-state-rules ps))
-   (parser-state-functions ps)
-   (reverse (parser-state-includes ps))
-   (reverse (parser-state-loads ps))
-   (parser-state-namespace ps)))
+   (reverse (pstate-rules ps))
+   (pstate-functions ps)))
 
 (def (parse-item ps)
-  "Parse a top-level item (rule, function, or directive)"
-  (let ((tok (parser-peek ps)))
-    (cond
-      ;; @include, @load, @namespace
-      ((parser-check ps 'AT-DIRECTIVE)
-       (parse-directive ps))
-      ;; function
-      ((parser-check ps 'function)
-       (parse-function ps))
-      ;; rule (pattern-action)
-      (else
-       (parse-rule ps)))))
+  (cond
+    ((check? ps 'function) (parse-function ps))
+    (else (parse-rule ps))))
 
-(def (parse-directive ps)
-  "Parse @include, @load, or @namespace directive"
-  (let* ((dir-tok (parser-advance! ps))
-         (name (tok-value dir-tok)))
-    (cond
-      ((eq? name 'include)
-       (let ((str-tok (parser-expect! ps 'STRING "@include requires string")))
-         (set! (parser-state-includes ps)
-               (cons (tok-value str-tok) (parser-state-includes ps)))))
-      ((eq? name 'load)
-       (let ((str-tok (parser-expect! ps 'STRING "@load requires string")))
-         (set! (parser-state-loads ps)
-               (cons (tok-value str-tok) (parser-state-loads ps)))))
-      ((eq? name 'namespace)
-       (let ((str-tok (parser-expect! ps 'STRING "@namespace requires string")))
-         (set! (parser-state-namespace ps) (tok-value str-tok))))
-      (else
-       (parser-error! ps (format "unknown directive: @~a" name))))))
+;;; Function definition
 
 (def (parse-function ps)
-  "Parse function definition"
-  (let ((line (tok-line (parser-peek ps))))
-    (parser-expect! ps 'function)
-    (let* ((name-tok (parser-expect! ps 'NAME "function name expected"))
-           (name (tok-value name-tok))
-           (params (parse-param-list ps)))
-      (lexer-skip-newlines! (parser-state-lexer ps))
-      (let ((body (parse-statement ps)))
-        (hash-put! (parser-state-functions ps) name
-                   (make-awk-func name params body line))))))
+  (advance! ps) ;; skip 'function'
+  (let* ((name (tok-value (expect! ps 'NAME)))
+         (params (parse-params ps)))
+    (skip-nl! ps)
+    (let ((body (parse-block ps)))
+      (hash-put! (pstate-functions ps) name
+                 (make-awk-func name params body)))))
 
-(def (parse-param-list ps)
-  "Parse function parameter list"
-  (parser-expect! ps 'LPAREN)
+(def (parse-params ps)
+  (expect! ps 'LPAREN)
   (let loop ((params '()))
-    (lexer-skip-newlines! (parser-state-lexer ps))
-    (if (parser-check ps 'RPAREN)
-      (begin (parser-advance! ps) (reverse params))
-      (let ((param-tok (parser-expect! ps 'NAME "parameter name expected")))
-        (let ((params (cons (tok-value param-tok) params)))
-          (lexer-skip-newlines! (parser-state-lexer ps))
-          (if (parser-check ps 'COMMA)
-            (begin (parser-advance! ps) (loop params))
-            (begin
-              (parser-expect! ps 'RPAREN)
-              (reverse params))))))))
+    (skip-nl! ps)
+    (cond
+      ((check? ps 'RPAREN) (advance! ps) (reverse params))
+      (else
+       (let ((name (tok-value (expect! ps 'NAME))))
+         (skip-nl! ps)
+         (if (check? ps 'COMMA)
+           (begin (advance! ps) (loop (cons name params)))
+           (begin (expect! ps 'RPAREN) (reverse (cons name params)))))))))
+
+;;; Rules
 
 (def (parse-rule ps)
-  "Parse a rule (pattern-action pair)"
-  (let ((line (tok-line (parser-peek ps))))
-    (let-values (((pattern action) (parse-rule-parts ps)))
-      (set! (parser-state-rules ps)
-            (cons (make-awk-rule pattern action line)
-                  (parser-state-rules ps))))))
+  (let-values (((pat act) (parse-rule-parts ps)))
+    (set! (pstate-rules ps)
+          (cons (make-awk-rule pat act)
+                (pstate-rules ps)))))
 
 (def (parse-rule-parts ps)
-  "Parse pattern and action parts of a rule"
-  (let ((tok (parser-peek ps)))
-    (cond
-      ;; BEGIN, END, BEGINFILE, ENDFILE
-      ((parser-check ps 'BEGIN)
-       (parser-advance! ps)
-       (values (make-awk-pattern-begin)
-               (parse-action ps)))
-      ((parser-check ps 'END)
-       (parser-advance! ps)
-       (values (make-awk-pattern-end)
-               (parse-action ps)))
-      ((parser-check ps 'BEGINFILE)
-       (parser-advance! ps)
-       (values (make-awk-pattern-beginfile)
-               (parse-action ps)))
-      ((parser-check ps 'ENDFILE)
-       (parser-advance! ps)
-       (values (make-awk-pattern-endfile)
-               (parse-action ps)))
-      ;; Action without pattern
-      ((parser-check ps 'LBRACE)
-       (values #f (parse-action ps)))
-      ;; Pattern-action
-      (else
-       (let ((pattern (parse-pattern ps)))
-         (lexer-skip-newlines! (parser-state-lexer ps))
-         (let ((action (parse-action ps)))
-           (values pattern action)))))))
+  (cond
+    ((check? ps 'BEGIN)
+     (advance! ps) (skip-nl! ps)
+     (values (make-awk-pattern-begin) (parse-action ps)))
+    ((check? ps 'END)
+     (advance! ps) (skip-nl! ps)
+     (values (make-awk-pattern-end) (parse-action ps)))
+    ((check? ps 'LBRACE)
+     (values #f (parse-action ps)))
+    (else
+     (let ((pat (parse-pattern ps)))
+       (skip-nl! ps)
+       (if (check? ps 'LBRACE)
+         (values pat (parse-action ps))
+         ;; Pattern without action = print $0
+         (values pat (make-awk-stmt-block
+                      (list (make-awk-stmt-print '() #f)))))))))
 
 (def (parse-pattern ps)
-  "Parse a pattern"
   (let ((first (parse-pattern-primary ps)))
-    (lexer-skip-newlines! (parser-state-lexer ps))
-    (if (parser-check ps 'COMMA)
-      (begin
-        (parser-advance! ps)
-        (lexer-skip-newlines! (parser-state-lexer ps))
+    (skip-nl! ps)
+    (if (check? ps 'COMMA)
+      (begin (advance! ps) (skip-nl! ps)
         (let ((second (parse-pattern-primary ps)))
           (make-awk-pattern-range first second)))
       first)))
 
 (def (parse-pattern-primary ps)
-  "Parse a primary pattern (expr or regex)"
-  (if (parser-check ps 'REGEX)
-    (let ((regex-tok (parser-advance! ps)))
-      (make-awk-pattern-expr
-       (make-awk-expr-regex (tok-value regex-tok) #f)))
-    (make-awk-pattern-expr (parse-expression ps))))
+  (if (check? ps 'REGEX)
+    (let ((t (advance! ps)))
+      (make-awk-pattern-expr (make-awk-expr-regex (tok-value t))))
+    (make-awk-pattern-expr (parse-expr ps))))
 
 (def (parse-action ps)
-  "Parse an action (block of statements)"
-  (if (parser-check ps 'LBRACE)
-    (begin
-      (parser-advance! ps)
-      (let ((stmts (parse-statement-list ps)))
-        (parser-expect! ps 'RBRACE)
-        (make-awk-stmt-block stmts)))
+  (if (check? ps 'LBRACE)
+    (parse-block ps)
     #f))
 
-(def (parse-statement-list ps)
-  "Parse a list of statements"
-  (let loop ((stmts '()))
-    (lexer-skip-newlines! (parser-state-lexer ps))
-    (if (or (parser-check ps 'RBRACE)
-            (parser-check ps 'EOF))
-      (reverse stmts)
-      (let ((stmt (parse-statement ps)))
-        (loop (cons stmt stmts))))))
-
-(def (parse-statement ps)
-  "Parse a single statement"
-  (lexer-skip-newlines! (parser-state-lexer ps))
-  (let ((tok (parser-peek ps)))
-    (cond
-      ((parser-check ps 'LBRACE)
-       (parse-block ps))
-      ((parser-check ps 'if)
-       (parse-if ps))
-      ((parser-check ps 'while)
-       (parse-while ps))
-      ((parser-check ps 'do)
-       (parse-do-while ps))
-      ((parser-check ps 'for)
-       (parse-for ps))
-      ((parser-check ps 'switch)
-       (parse-switch ps))
-      ((parser-check ps 'break)
-       (parser-advance! ps)
-       (make-awk-stmt-break))
-      ((parser-check ps 'continue)
-       (parser-advance! ps)
-       (make-awk-stmt-continue))
-      ((parser-check ps 'next)
-       (parser-advance! ps)
-       (make-awk-stmt-next))
-      ((parser-check ps 'nextfile)
-       (parser-advance! ps)
-       (make-awk-stmt-nextfile))
-      ((parser-check ps 'exit)
-       (parse-exit ps))
-      ((parser-check ps 'return)
-       (parse-return ps))
-      ((parser-check ps 'delete)
-       (parse-delete ps))
-      ((parser-check ps 'print)
-       (parse-print ps))
-      ((parser-check ps 'printf)
-       (parse-printf ps))
-      ((parser-check ps 'SEMI)
-       (parser-advance! ps)
-       (make-awk-stmt-block '()))
-      (else
-       (let ((expr (parse-expression ps)))
-         (make-awk-stmt-expr expr))))))
+;;; Block and statements
 
 (def (parse-block ps)
-  "Parse a block { statements }"
-  (parser-expect! ps 'LBRACE)
-  (let ((stmts (parse-statement-list ps)))
-    (parser-expect! ps 'RBRACE)
+  (expect! ps 'LBRACE)
+  (let ((stmts (parse-stmt-list ps)))
+    (expect! ps 'RBRACE)
     (make-awk-stmt-block stmts)))
 
+(def (parse-stmt-list ps)
+  (let loop ((stmts '()))
+    (skip-nl! ps)
+    (if (or (check? ps 'RBRACE) (check? ps 'EOF))
+      (reverse stmts)
+      (let ((s (parse-stmt ps)))
+        (term! ps)
+        (loop (cons s stmts))))))
+
+(def (parse-stmt ps)
+  (skip-nl! ps)
+  (let ((type (tok-type (peek ps))))
+    (case type
+      ((LBRACE) (parse-block ps))
+      ((if) (parse-if ps))
+      ((while) (parse-while ps))
+      ((do) (parse-do-while ps))
+      ((for) (parse-for ps))
+      ((break) (advance! ps) (make-awk-stmt-break))
+      ((continue) (advance! ps) (make-awk-stmt-continue))
+      ((next) (advance! ps) (make-awk-stmt-next))
+      ((nextfile) (advance! ps) (make-awk-stmt-nextfile))
+      ((exit) (parse-exit ps))
+      ((return) (parse-return ps))
+      ((delete) (parse-delete ps))
+      ((print) (parse-print ps))
+      ((printf) (parse-printf ps))
+      ((SEMI) (advance! ps) (make-awk-stmt-block '()))
+      (else
+       (let ((e (parse-expr ps)))
+         (make-awk-stmt-expr e))))))
+
 (def (parse-if ps)
-  "Parse if statement"
-  (parser-advance! ps)
-  (parser-expect! ps 'LPAREN)
-  (let ((condition (parse-expression ps)))
-    (parser-expect! ps 'RPAREN)
-    (lexer-skip-newlines! (parser-state-lexer ps))
-    (let ((then-branch (parse-statement ps)))
-      (lexer-skip-newlines! (parser-state-lexer ps))
-      (if (parser-check ps 'else)
-        (begin
-          (parser-advance! ps)
-          (lexer-skip-newlines! (parser-state-lexer ps))
-          (let ((else-branch (parse-statement ps)))
-            (make-awk-stmt-if condition then-branch else-branch)))
-        (make-awk-stmt-if condition then-branch #f)))))
+  (advance! ps)
+  (expect! ps 'LPAREN)
+  (let ((cond (parse-expr ps)))
+    (expect! ps 'RPAREN)
+    (skip-nl! ps)
+    (let ((then (parse-stmt ps)))
+      (term! ps)
+      (skip-nl! ps)
+      (if (check? ps 'else)
+        (begin (advance! ps) (skip-nl! ps)
+          (make-awk-stmt-if cond then (parse-stmt ps)))
+        (make-awk-stmt-if cond then #f)))))
 
 (def (parse-while ps)
-  "Parse while statement"
-  (parser-advance! ps)
-  (parser-expect! ps 'LPAREN)
-  (let ((condition (parse-expression ps)))
-    (parser-expect! ps 'RPAREN)
-    (lexer-skip-newlines! (parser-state-lexer ps))
-    (let ((body (parse-statement ps)))
-      (make-awk-stmt-while condition body))))
+  (advance! ps)
+  (expect! ps 'LPAREN)
+  (let ((cond (parse-expr ps)))
+    (expect! ps 'RPAREN)
+    (skip-nl! ps)
+    (make-awk-stmt-while cond (parse-stmt ps))))
 
 (def (parse-do-while ps)
-  "Parse do-while statement"
-  (parser-advance! ps)
-  (lexer-skip-newlines! (parser-state-lexer ps))
-  (let ((body (parse-statement ps)))
-    (lexer-skip-newlines! (parser-state-lexer ps))
-    (parser-expect! ps 'while)
-    (parser-expect! ps 'LPAREN)
-    (let ((condition (parse-expression ps)))
-      (parser-expect! ps 'RPAREN)
-      (make-awk-stmt-do-while body condition))))
+  (advance! ps) (skip-nl! ps)
+  (let ((body (parse-stmt ps)))
+    (skip-nl! ps) (term! ps) (skip-nl! ps)
+    (expect! ps 'while)
+    (expect! ps 'LPAREN)
+    (let ((cond (parse-expr ps)))
+      (expect! ps 'RPAREN)
+      (make-awk-stmt-do-while body cond))))
 
 (def (parse-for ps)
-  "Parse for statement"
-  (parser-advance! ps)
-  (parser-expect! ps 'LPAREN)
-  
-  ;; Check for for-in
-  (if (and (parser-check ps 'NAME)
-           (let ((next (lexer-char-at (parser-state-lexer ps) 0)))
-             (eq? next #\space)))
-      (let loop ((names '()))
-        (let ((name-tok (parser-peek ps)))
-          (if (and name-tok (eq? (tok-type name-tok) 'NAME))
-            (begin
-              (parser-advance! ps)
-              (let ((names (cons (tok-value name-tok) names)))
-                (if (parser-check ps 'COMMA)
-                  (begin (parser-advance! ps) (loop names))
-                  (begin
-                    (parser-expect! ps 'in)
-                    (let ((array-tok (parser-expect! ps 'NAME "array name expected")))
-                      (parser-expect! ps 'RPAREN)
-                      (lexer-skip-newlines! (parser-state-lexer ps))
-                      (let ((body (parse-statement ps)))
-                        ;; Multi-dimensional: reconstruct as single var
-                        (if (= (length names) 1)
-                          (make-awk-stmt-for-in (car names) (tok-value array-tok) body)
-                          ;; For multi-dim, use first var and handle specially
-                          (make-awk-stmt-for-in (car names) (tok-value array-tok) body)))))))))
-            (error "expected variable in for-in"))))
-      ;; Regular for
-      (let ((init (if (parser-check ps 'SEMI) #f (parse-expression ps))))
-        (parser-expect! ps 'SEMI)
-        (let ((condition (if (parser-check ps 'SEMI) #f (parse-expression ps))))
-          (parser-expect! ps 'SEMI)
-          (let ((update (if (parser-check ps 'RPAREN) #f (parse-expression ps))))
-            (parser-expect! ps 'RPAREN)
-            (lexer-skip-newlines! (parser-state-lexer ps))
-            (let ((body (parse-statement ps)))
-              (make-awk-stmt-for init condition update body)))))))
+  (advance! ps) ;; skip 'for'
+  (expect! ps 'LPAREN)
+  (skip-nl! ps)
+  ;; Try to detect for-in: for (VAR in ARRAY)
+  ;; Look ahead: NAME followed by 'in'
+  (if (and (check? ps 'NAME)
+           (eq? (tok-type (lex-peek-ahead (pstate-lex ps))) 'in))
+    ;; for-in
+    (let* ((var (tok-value (advance! ps))))
+      (advance! ps) ;; skip 'in'
+      (let ((arr (tok-value (expect! ps 'NAME))))
+        (expect! ps 'RPAREN)
+        (skip-nl! ps)
+        (make-awk-stmt-for-in var arr (parse-stmt ps))))
+    ;; Regular for
+    (let ((init (if (check? ps 'SEMI) #f (parse-expr ps))))
+      (expect! ps 'SEMI)
+      (let ((cond (if (check? ps 'SEMI) #f (parse-expr ps))))
+        (expect! ps 'SEMI)
+        (let ((upd (if (check? ps 'RPAREN) #f (parse-expr ps))))
+          (expect! ps 'RPAREN)
+          (skip-nl! ps)
+          (make-awk-stmt-for init cond upd (parse-stmt ps)))))))
 
-(def (parse-switch ps)
-  "Parse switch statement"
-  (parser-advance! ps)
-  (parser-expect! ps 'LPAREN)
-  (let ((expr (parse-expression ps)))
-    (parser-expect! ps 'RPAREN)
-    (lexer-skip-newlines! (parser-state-lexer ps))
-    (parser-expect! ps 'LBRACE)
-    (let ((cases (parse-case-list ps)))
-      (parser-expect! ps 'RBRACE)
-      (make-awk-stmt-switch expr cases))))
-
-(def (parse-case-list ps)
-  "Parse list of cases"
-  (let loop ((cases '()))
-    (lexer-skip-newlines! (parser-state-lexer ps))
-    (if (parser-check ps 'RBRACE)
-      (reverse cases)
-      (let ((case (parse-case ps)))
-        (loop (cons case cases))))))
-
-(def (parse-case ps)
-  "Parse a case clause"
-  (cond
-    ((parser-check ps 'case)
-     (parser-advance! ps)
-     (let ((value (parse-expression ps)))
-       (parser-expect! ps 'COLON)
-       (let ((stmts (parse-statement-list-until-case ps)))
-         (make-awk-case value stmts))))
-    ((parser-check ps 'default)
-     (parser-advance! ps)
-     (parser-expect! ps 'COLON)
-     (let ((stmts (parse-statement-list-until-case ps)))
-       (make-awk-case #f stmts)))
-    (else
-     (error "expected case or default"))))
-
-(def (parse-statement-list-until-case ps)
-  "Parse statements until next case/default/}"
-  (let loop ((stmts '()))
-    (lexer-skip-newlines! (parser-state-lexer ps))
-    (if (or (parser-check ps 'case)
-            (parser-check ps 'default)
-            (parser-check ps 'RBRACE))
-      (reverse stmts)
-      (let ((stmt (parse-statement ps)))
-        (loop (cons stmt stmts))))))
+(def (lex-peek-ahead lex)
+  "Peek at the token AFTER the already-peeked one. Non-destructive."
+  ;; Save state, read one token from current pos, restore
+  (let* ((saved-peeked (lexer-peeked lex))
+         (saved-pos (lexer-pos lex))
+         (saved-line (lexer-line lex))
+         (saved-col (lexer-column lex))
+         (saved-last (lexer-last-type lex)))
+    ;; Clear peeked so lex-next! reads fresh from pos
+    (set! (lexer-peeked lex) #f)
+    ;; pos is already past the peeked token, so next token is what follows it
+    (let ((result (lex-next! lex)))
+      ;; Restore everything
+      (set! (lexer-peeked lex) saved-peeked)
+      (set! (lexer-pos lex) saved-pos)
+      (set! (lexer-line lex) saved-line)
+      (set! (lexer-column lex) saved-col)
+      (set! (lexer-last-type lex) saved-last)
+      result)))
 
 (def (parse-exit ps)
-  "Parse exit statement"
-  (parser-advance! ps)
-  (lexer-skip-newlines! (parser-state-lexer ps))
-  (if (or (parser-check ps 'NEWLINE)
-          (parser-check ps 'SEMI)
-          (parser-check ps 'RBRACE))
+  (advance! ps)
+  (if (or (check? ps 'NEWLINE) (check? ps 'SEMI)
+          (check? ps 'RBRACE) (check? ps 'EOF))
     (make-awk-stmt-exit #f)
-    (make-awk-stmt-exit (parse-expression ps))))
+    (make-awk-stmt-exit (parse-expr ps))))
 
 (def (parse-return ps)
-  "Parse return statement"
-  (parser-advance! ps)
-  (lexer-skip-newlines! (parser-state-lexer ps))
-  (if (or (parser-check ps 'NEWLINE)
-          (parser-check ps 'SEMI)
-          (parser-check ps 'RBRACE))
+  (advance! ps)
+  (if (or (check? ps 'NEWLINE) (check? ps 'SEMI)
+          (check? ps 'RBRACE) (check? ps 'EOF))
     (make-awk-stmt-return #f)
-    (make-awk-stmt-return (parse-expression ps))))
+    (make-awk-stmt-return (parse-expr ps))))
 
 (def (parse-delete ps)
-  "Parse delete statement"
-  (parser-advance! ps)
-  (let ((array-tok (parser-expect! ps 'NAME "array name expected")))
-    (if (parser-check ps 'LBRACKET)
-      (begin
-        (parser-advance! ps)
-        (let ((subscripts (parse-expression-list ps)))
-          (parser-expect! ps 'RBRACKET)
-          (make-awk-stmt-delete (tok-value array-tok) subscripts)))
-      (make-awk-stmt-delete (tok-value array-tok) #f))))
+  (advance! ps) ;; skip 'delete'
+  (let ((target (parse-primary ps)))
+    (make-awk-stmt-delete target)))
+
+;;; Print / Printf
 
 (def (parse-print ps)
-  "Parse print statement"
-  (parser-advance! ps)
-  (let-values (((args redirect append?) (parse-print-args ps)))
-    (make-awk-stmt-print args redirect append?)))
+  (advance! ps) ;; skip 'print'
+  ;; Parse arguments until redirect or terminator
+  (let loop ((args '()) (first? #t))
+    (cond
+      ;; Terminator
+      ((or (check? ps 'NEWLINE) (check? ps 'SEMI)
+           (check? ps 'RBRACE) (check? ps 'EOF)
+           (check? ps 'PIPE))
+       (let ((redir (parse-output-redir ps)))
+         (make-awk-stmt-print (reverse args) redir)))
+      ;; Redirect
+      ((or (check? ps 'GT) (check? ps 'APPEND))
+       (let ((redir (parse-output-redir ps)))
+         (make-awk-stmt-print (reverse args) redir)))
+      ;; Comma between args
+      ((and (not first?) (check? ps 'COMMA))
+       (advance! ps) (skip-nl! ps)
+       (loop (cons (parse-non-assign-expr ps) args) #f))
+      ;; First or next arg
+      (first?
+       (loop (cons (parse-non-assign-expr ps) args) #f))
+      (else
+       (let ((redir (parse-output-redir ps)))
+         (make-awk-stmt-print (reverse args) redir))))))
 
 (def (parse-printf ps)
-  "Parse printf statement"
-  (parser-advance! ps)
-  (let* ((format (parse-expression ps))
-         (_ (lexer-skip-newlines! (parser-state-lexer ps)))
-         (args (if (parser-check ps 'COMMA)
-                 (begin
-                   (parser-advance! ps)
-                   (parse-expression-list ps))
-                 '())))
-    (let-values (((_ redirect append?) (parse-redirect ps)))
-      (make-awk-stmt-printf format args redirect append?))))
+  (advance! ps) ;; skip 'printf'
+  (let ((fmt (parse-non-assign-expr ps)))
+    (let loop ((args '()))
+      (cond
+        ((check? ps 'COMMA)
+         (advance! ps) (skip-nl! ps)
+         (loop (cons (parse-non-assign-expr ps) args)))
+        (else
+         (let ((redir (parse-output-redir ps)))
+           (make-awk-stmt-printf fmt (reverse args) redir)))))))
 
-(def (parse-print-args ps)
-  "Parse arguments and redirection for print"
-  (let loop ((args '()))
-    (lexer-skip-newlines! (parser-state-lexer ps))
-    (cond
-      ((parser-check ps 'COMMA)
-       (parser-advance! ps)
-       (loop (cons (parse-expression ps) args)))
-      ((or (parser-check ps 'GT)
-            (parser-check ps 'PIPE)
-            (parser-check ps 'PIPEAMP)
-            (parser-check ps 'RSHIFT))
-       (let-values (((redirect append?) (parse-redirect ps)))
-         (values (reverse args) redirect append?)))
-      ((or (parser-check ps 'NEWLINE)
-            (parser-check ps 'SEMI)
-            (parser-check ps 'RBRACE)
-            (parser-check ps 'EOF))
-       (values (reverse args) #f #f))
-      ((null? args)
-       ;; First arg without comma
-       (let ((expr (parse-expression ps)))
-         (loop (cons expr args))))
-      (else
-       (values (reverse args) #f #f)))))
-
-(def (parse-redirect ps)
-  "Parse output redirection"
+(def (parse-output-redir ps)
+  "Parse output redirection for print/printf, or return #f"
   (cond
-    ((parser-check ps 'GT)
-     (parser-advance! ps)
-     (values (make-awk-redirect-file (parse-expression ps) #f) #f))
-    ((parser-check ps 'RSHIFT)
-     (parser-advance! ps)
-     (values (make-awk-redirect-file (parse-expression ps) #t) #t))
-    ((parser-check ps 'PIPE)
-     (parser-advance! ps)
-     (values (make-awk-redirect-pipe (parse-expression ps) #f) #f))
-    ((parser-check ps 'PIPEAMP)
-     (parser-advance! ps)
-     (values (make-awk-redirect-pipe (parse-expression ps) #t) #t))
-    (else (values #f #f))))
+    ((check? ps 'GT)
+     (advance! ps)
+     (make-awk-redirect 'file (parse-non-assign-expr ps)))
+    ((check? ps 'APPEND)
+     (advance! ps)
+     (make-awk-redirect 'append (parse-non-assign-expr ps)))
+    ((check? ps 'PIPE)
+     (advance! ps)
+     (make-awk-redirect 'pipe (parse-non-assign-expr ps)))
+    (else #f)))
 
-(def (parse-expression-list ps)
-  "Parse comma-separated expression list"
-  (let loop ((exprs '()))
-    (let ((expr (parse-expression ps)))
-      (if (parser-check ps 'COMMA)
-        (begin
-          (parser-advance! ps)
-          (loop (cons expr exprs)))
-        (reverse (cons expr exprs))))))
+;;; Expression parsing — parse-non-assign-expr avoids treating > as comparison
+;;; inside print args (it's output redirection there)
 
-;;; Expression parsing (precedence climbing)
+(def (parse-non-assign-expr ps)
+  "Parse expression but stop at >/>>/| (for print redirection)"
+  (parse-ternary-no-redir ps))
 
-(def (parse-expression ps)
-  "Parse an expression (entry point)"
-  (parse-assignment ps))
+(def (parse-ternary-no-redir ps)
+  (let ((cond (parse-or-no-redir ps)))
+    (if (check? ps 'QUESTION)
+      (begin (advance! ps)
+        (let ((then (parse-expr ps)))
+          (expect! ps 'COLON)
+          (let ((els (parse-ternary-no-redir ps)))
+            (make-awk-expr-ternary cond then els))))
+      cond)))
 
-(def (parse-assignment ps)
-  "Parse assignment (right-associative, lowest precedence)"
-  (let ((left (parse-ternary ps)))
-    (if (memq (tok-type (parser-peek ps))
-              '(ASSIGN PLUSEQ MINUSEQ STAREQ SLASHEQ PERCENTEQ CARETEQ))
-      (let ((op-tok (parser-advance! ps)))
-        (let ((right (parse-assignment ps))
-              (op (case (tok-type op-tok)
-                    ((ASSIGN) '=)
-                    ((PLUSEQ) '+=)
-                    ((MINUSEQ) '-=)
-                    ((STAREQ) '*=)
-                    ((SLASHEQ) '/=)
-                    ((PERCENTEQ) '%=)
-                    ((CARETEQ) '^=))))
-          (if (eq? op '=)
-            (make-awk-expr-assign left right)
-            (make-awk-expr-assign-op op left right))))
+(def (parse-or-no-redir ps)
+  (let loop ((left (parse-and-no-redir ps)))
+    (if (check? ps 'OR)
+      (begin (advance! ps) (skip-nl! ps)
+        (loop (make-awk-expr-binop '|| left (parse-and-no-redir ps))))
       left)))
 
+(def (parse-and-no-redir ps)
+  (let loop ((left (parse-in-expr-no-redir ps)))
+    (if (check? ps 'AND)
+      (begin (advance! ps) (skip-nl! ps)
+        (loop (make-awk-expr-binop '&& left (parse-in-expr-no-redir ps))))
+      left)))
+
+(def (parse-in-expr-no-redir ps)
+  (let ((left (parse-ere-match-no-redir ps)))
+    (if (check? ps 'in)
+      (begin (advance! ps)
+        (let ((arr (tok-value (expect! ps 'NAME))))
+          (let ((subs (if (awk-expr-array-ref? left)
+                        (awk-expr-array-ref-subscripts left)
+                        (list left))))
+            (make-awk-expr-in subs arr))))
+      left)))
+
+(def (parse-ere-match-no-redir ps)
+  (let loop ((left (parse-comparison-no-redir ps)))
+    (cond
+      ((check? ps 'MATCH)
+       (advance! ps)
+       (loop (make-awk-expr-match left (parse-comparison-no-redir ps) #f)))
+      ((check? ps 'NOMATCH)
+       (advance! ps)
+       (loop (make-awk-expr-match left (parse-comparison-no-redir ps) #t)))
+      (else left))))
+
+(def (parse-comparison-no-redir ps)
+  "Like parse-comparison but does NOT consume GT, GE, APPEND, PIPE"
+  (let ((left (parse-concat ps)))
+    (let ((type (tok-type (peek ps))))
+      (if (memq type '(LT LE EQ NE))
+        (let* ((t (advance! ps))
+               (op (case type
+                     ((LT) '<) ((LE) '<=) ((EQ) '==) ((NE) '!=))))
+          (make-awk-expr-binop op left (parse-concat ps)))
+        left))))
+
+(def (parse-expr ps)
+  "Parse full expression including assignment"
+  (let ((left (parse-ternary ps)))
+    (cond
+      ((check? ps 'ASSIGN)
+       (advance! ps)
+       (make-awk-expr-assign left (parse-expr ps)))
+      ((memq (tok-type (peek ps)) '(PLUSEQ MINUSEQ STAREQ SLASHEQ PERCENTEQ CARETEQ))
+       (let* ((t (advance! ps))
+              (op (case (tok-type t)
+                    ((PLUSEQ) '+=) ((MINUSEQ) '-=) ((STAREQ) '*=)
+                    ((SLASHEQ) '/=) ((PERCENTEQ) '%=) ((CARETEQ) '^=))))
+         (make-awk-expr-assign-op op left (parse-expr ps))))
+      (else left))))
+
 (def (parse-ternary ps)
-  "Parse ternary conditional (right-associative)"
-  (let ((condition (parse-or ps)))
-    (if (parser-check ps 'QUESTION)
-      (begin
-        (parser-advance! ps)
-        (let ((then-expr (parse-expression ps)))
-          (parser-expect! ps 'COLON)
-          (let ((else-expr (parse-ternary ps)))
-            (make-awk-expr-ternary condition then-expr else-expr))))
-      condition)))
+  (let ((cond (parse-or ps)))
+    (if (check? ps 'QUESTION)
+      (begin (advance! ps)
+        (let ((then (parse-expr ps)))
+          (expect! ps 'COLON)
+          (let ((els (parse-ternary ps)))
+            (make-awk-expr-ternary cond then els))))
+      cond)))
 
 (def (parse-or ps)
-  "Parse logical OR"
   (let loop ((left (parse-and ps)))
-    (if (parser-check ps 'OR)
-      (begin
-        (parser-advance! ps)
-        (let ((right (parse-and ps)))
-          (loop (make-awk-expr-binop '|| left right))))
+    (if (check? ps 'OR)
+      (begin (advance! ps) (skip-nl! ps)
+        (loop (make-awk-expr-binop '|| left (parse-and ps))))
       left)))
 
 (def (parse-and ps)
-  "Parse logical AND"
-  (let loop ((left (parse-in ps)))
-    (if (parser-check ps 'AND)
-      (begin
-        (parser-advance! ps)
-        (let ((right (parse-in ps)))
-          (loop (make-awk-expr-binop '&& left right))))
+  (let loop ((left (parse-in-expr ps)))
+    (if (check? ps 'AND)
+      (begin (advance! ps) (skip-nl! ps)
+        (loop (make-awk-expr-binop '&& left (parse-in-expr ps))))
       left)))
 
-(def (parse-in ps)
-  "Parse (index) in array"
-  (let ((left (parse-match ps)))
-    (if (parser-check ps 'in)
-      (let ((in-tok (parser-advance! ps)))
-        (if (awk-expr-array-ref? left)
-          (let ((array-tok (parser-expect! ps 'NAME "array name expected")))
-            (make-awk-expr-in (awk-expr-array-ref-subscripts left)
-                             (tok-value array-tok)))
-          (error "'in' requires array subscript")))
+(def (parse-in-expr ps)
+  (let ((left (parse-ere-match ps)))
+    (if (check? ps 'in)
+      (begin (advance! ps)
+        (let ((arr (tok-value (expect! ps 'NAME))))
+          ;; Convert left into subscript list
+          (let ((subs (if (awk-expr-array-ref? left)
+                        (awk-expr-array-ref-subscripts left)
+                        (list left))))
+            (make-awk-expr-in subs arr))))
       left)))
 
-(def (parse-match ps)
-  "Parse regex match operators"
+(def (parse-ere-match ps)
   (let loop ((left (parse-comparison ps)))
-    (if (memq (tok-type (parser-peek ps)) '(MATCH NOMATCH))
-      (let ((op-tok (parser-advance! ps)))
-        (let ((right (parse-comparison ps)))
-          (loop (make-awk-expr-binop
-                 (if (eq? (tok-type op-tok) 'MATCH) '~ '!~)
-                 left right))))
-      left)))
+    (cond
+      ((check? ps 'MATCH)
+       (advance! ps)
+       (loop (make-awk-expr-match left (parse-comparison ps) #f)))
+      ((check? ps 'NOMATCH)
+       (advance! ps)
+       (loop (make-awk-expr-match left (parse-comparison ps) #t)))
+      (else left))))
 
 (def (parse-comparison ps)
-  "Parse comparison operators"
   (let ((left (parse-concat ps)))
-    (if (memq (tok-type (parser-peek ps))
-              '(LT LE GT GE EQ NE))
-      (let ((op-tok (parser-advance! ps)))
-        (let ((right (parse-concat ps))
-              (op (case (tok-type op-tok)
-                    ((LT) '<)
-                    ((LE) '<=)
-                    ((GT) '>)
-                    ((GE) '>=)
-                    ((EQ) '==)
-                    ((NE) '!=))))
-          (make-awk-expr-binop op left right)))
-      left)))
+    (let ((type (tok-type (peek ps))))
+      (cond
+        ((memq type '(LT LE GT GE EQ NE))
+         (let* ((t (advance! ps))
+                (op (case type
+                      ((LT) '<) ((LE) '<=) ((GT) '>) ((GE) '>=)
+                      ((EQ) '==) ((NE) '!=))))
+           (make-awk-expr-binop op left (parse-concat ps))))
+        ;; cmd | getline [var]
+        ((and (eq? type 'PIPE) (eq? (tok-type (lex-peek-ahead (pstate-lex ps))) 'getline))
+         (advance! ps) ;; skip PIPE
+         (advance! ps) ;; skip getline
+         (let ((var (if (check? ps 'NAME) (tok-value (advance! ps)) #f)))
+           (make-awk-expr-getline var left #t)))
+        (else left)))))
 
 (def (parse-concat ps)
-  "Parse implicit string concatenation"
-  (let loop ((left (parse-additive ps)))
-    (let ((tok (parser-peek ps)))
-      ;; Concatenation: adjacent value-producing tokens without operator
-      (if (and tok
-               (memq (tok-type tok)
-                     '(NUMBER STRING NAME REGEX TYPED-REGEX
-                       LPAREN DOLLAR NOT PLUS MINUS)))
-          (let ((right (parse-additive ps)))
-            (loop (make-awk-expr-concat left right)))
-          left))))
+  (let loop ((left (parse-addition ps)))
+    ;; Concatenation: next token starts a value but is NOT an operator
+    (let ((type (tok-type (peek ps))))
+      (if (memq type '(NUMBER STRING NAME REGEX LPAREN DOLLAR NOT
+                        PLUSPLUS MINUSMINUS MINUS))
+        ;; But MINUS could be subtraction — only concat if it's unary context
+        ;; Actually in AWK, adjacency IS concatenation. But we must not
+        ;; grab things that are part of a different production.
+        ;; Safest: only concat for value-starting tokens that aren't binary ops
+        (if (memq type '(NUMBER STRING NAME REGEX LPAREN DOLLAR NOT
+                          PLUSPLUS MINUSMINUS))
+          (loop (make-awk-expr-concat left (parse-addition ps)))
+          left)
+        left))))
 
-(def (parse-additive ps)
-  "Parse addition and subtraction"
-  (let loop ((left (parse-multiplicative ps)))
-    (if (memq (tok-type (parser-peek ps)) '(PLUS MINUS))
-      (let ((op-tok (parser-advance! ps)))
-        (let ((right (parse-multiplicative ps)))
-          (loop (make-awk-expr-binop
-                 (if (eq? (tok-type op-tok) 'PLUS) '+ '-)
-                 left right))))
-      left)))
+(def (parse-addition ps)
+  (let loop ((left (parse-multiplication ps)))
+    (let ((type (tok-type (peek ps))))
+      (cond
+        ((eq? type 'PLUS)
+         (advance! ps) (loop (make-awk-expr-binop '+ left (parse-multiplication ps))))
+        ((eq? type 'MINUS)
+         (advance! ps) (loop (make-awk-expr-binop '- left (parse-multiplication ps))))
+        (else left)))))
 
-(def (parse-multiplicative ps)
-  "Parse multiplication, division, modulo"
+(def (parse-multiplication ps)
   (let loop ((left (parse-power ps)))
-    (if (memq (tok-type (parser-peek ps)) '(STAR SLASH PERCENT))
-      (let ((op-tok (parser-advance! ps)))
-        (let ((right (parse-power ps))
-              (op (case (tok-type op-tok)
-                    ((STAR) '*)
-                    ((SLASH) '/)
-                    ((PERCENT) '%))))
-          (loop (make-awk-expr-binop op left right))))
-      left)))
+    (let ((type (tok-type (peek ps))))
+      (cond
+        ((eq? type 'STAR)
+         (advance! ps) (loop (make-awk-expr-binop '* left (parse-power ps))))
+        ((eq? type 'SLASH)
+         (advance! ps) (loop (make-awk-expr-binop '/ left (parse-power ps))))
+        ((eq? type 'PERCENT)
+         (advance! ps) (loop (make-awk-expr-binop '% left (parse-power ps))))
+        (else left)))))
 
 (def (parse-power ps)
-  "Parse exponentiation (right-associative)"
   (let ((left (parse-unary ps)))
-    (if (memq (tok-type (parser-peek ps)) '(CARET STARSTAR))
-      (begin
-        (parser-advance! ps)
-        (let ((right (parse-power ps)))
-          (make-awk-expr-binop '^ left right)))
+    (if (or (check? ps 'CARET) (check? ps 'STARSTAR))
+      (begin (advance! ps) (make-awk-expr-binop '^ left (parse-power ps)))
       left)))
 
 (def (parse-unary ps)
-  "Parse unary operators"
-  (let ((tok (parser-peek ps)))
+  (let ((type (tok-type (peek ps))))
     (cond
-      ((parser-check ps 'NOT)
-       (parser-advance! ps)
-       (make-awk-expr-unop '! (parse-unary ps)))
-      ((parser-check ps 'MINUS)
-       (parser-advance! ps)
-       (make-awk-expr-unop '- (parse-unary ps)))
-      ((parser-check ps 'PLUS)
-       (parser-advance! ps)
-       (make-awk-expr-unop '+ (parse-unary ps)))
-      ((parser-check ps 'PLUSPLUS)
-       (parser-advance! ps)
-       (make-awk-expr-pre-inc (parse-postfix ps)))
-      ((parser-check ps 'MINUSMINUS)
-       (parser-advance! ps)
-       (make-awk-expr-pre-dec (parse-postfix ps)))
+      ((eq? type 'NOT)
+       (advance! ps) (make-awk-expr-unop '! (parse-unary ps)))
+      ((eq? type 'MINUS)
+       (advance! ps) (make-awk-expr-unop '- (parse-unary ps)))
+      ((eq? type 'PLUS)
+       (advance! ps) (make-awk-expr-unop '+ (parse-unary ps)))
+      ((eq? type 'PLUSPLUS)
+       (advance! ps) (make-awk-expr-pre-inc (parse-unary ps)))
+      ((eq? type 'MINUSMINUS)
+       (advance! ps) (make-awk-expr-pre-dec (parse-unary ps)))
       (else (parse-postfix ps)))))
 
 (def (parse-postfix ps)
-  "Parse postfix operators (++, --)"
   (let ((left (parse-primary ps)))
-    (let loop ((expr left))
+    (let loop ((e left))
       (cond
-        ((parser-check ps 'PLUSPLUS)
-         (parser-advance! ps)
-         (loop (make-awk-expr-post-inc expr)))
-        ((parser-check ps 'MINUSMINUS)
-         (parser-advance! ps)
-         (loop (make-awk-expr-post-dec expr)))
-        (else expr)))))
+        ((check? ps 'PLUSPLUS)  (advance! ps) (loop (make-awk-expr-post-inc e)))
+        ((check? ps 'MINUSMINUS) (advance! ps) (loop (make-awk-expr-post-dec e)))
+        (else e)))))
 
 (def (parse-primary ps)
-  "Parse primary expressions"
-  (let ((tok (parser-peek ps)))
-    (cond
-      ;; Number
-      ((parser-check ps 'NUMBER)
-       (let ((tok (parser-advance! ps)))
-         (make-awk-expr-number (tok-value tok))))
-      
-      ;; String
-      ((parser-check ps 'STRING)
-       (let ((tok (parser-advance! ps)))
-         (make-awk-expr-string (tok-value tok))))
-      
-      ;; Regex
-      ((parser-check ps 'REGEX)
-       (let ((tok (parser-advance! ps)))
-         (make-awk-expr-regex (tok-value tok) #f)))
-      
-      ;; Typed regex @/pattern/
-      ((parser-check ps 'TYPED-REGEX)
-       (let ((tok (parser-advance! ps)))
-         (make-awk-expr-regex (tok-value tok) #f)))
-      
-      ;; Field reference $
-      ((parser-check ps 'DOLLAR)
-       (parser-advance! ps)
-       (make-awk-expr-field (parse-unary ps)))
-      
-      ;; Parenthesized expression or (subscript) in array
-      ((parser-check ps 'LPAREN)
-       (parser-advance! ps)
-       (let ((expr (parse-expression ps)))
-         (if (parser-check ps 'COMMA)
-           ;; Multi-dimensional subscript
-           (let ((subscripts (cons expr (parse-subscript-rest ps))))
-             (parser-expect! ps 'RPAREN)
-             (if (parser-check ps 'in)
-               (begin (parser-advance! ps)
-                      (let ((array-tok (parser-expect! ps 'NAME)))
-                        (make-awk-expr-in subscripts (tok-value array-tok))))
-               (error "expected 'in' after subscript")))
-           (begin
-             (parser-expect! ps 'RPAREN)
-             expr))))
-      
-      ;; Name (variable, function call, or array reference)
-      ((parser-check ps 'NAME)
-       (let* ((name-tok (parser-advance! ps))
-              (name (tok-value name-tok)))
+  (let ((type (tok-type (peek ps))))
+    (case type
+      ((NUMBER) (let ((t (advance! ps))) (make-awk-expr-number (tok-value t))))
+      ((STRING) (let ((t (advance! ps))) (make-awk-expr-string (tok-value t))))
+      ((REGEX) (let ((t (advance! ps))) (make-awk-expr-regex (tok-value t))))
+      ((DOLLAR) (advance! ps) (make-awk-expr-field (parse-primary ps)))
+      ((LPAREN)
+       (advance! ps)
+       (let ((e (parse-expr ps)))
+         ;; Check for (expr, expr, ...) in array
+         (if (check? ps 'COMMA)
+           ;; Multi-dim subscript for 'in' expression
+           (let loop ((subs (list e)))
+             (if (check? ps 'COMMA)
+               (begin (advance! ps) (loop (cons (parse-expr ps) subs)))
+               (begin (expect! ps 'RPAREN)
+                 (if (check? ps 'in)
+                   (begin (advance! ps)
+                     (let ((arr (tok-value (expect! ps 'NAME))))
+                       (make-awk-expr-in (reverse subs) arr)))
+                   (error "expected 'in' after (expr,expr)")))))
+           (begin (expect! ps 'RPAREN) e))))
+      ((NAME)
+       (let* ((t (advance! ps))
+              (name (tok-value t)))
          (cond
-           ;; Function call
-           ((parser-check ps 'LPAREN)
-            (parser-advance! ps)
-            (let ((args (if (parser-check ps 'RPAREN)
-                          '()
-                          (parse-expression-list ps))))
-              (parser-expect! ps 'RPAREN)
+           ;; Function call: NAME(
+           ((check? ps 'LPAREN)
+            (advance! ps)
+            (let ((args (if (check? ps 'RPAREN) '() (parse-expr-list ps))))
+              (expect! ps 'RPAREN)
               (make-awk-expr-call name args)))
-           ;; Array reference
-           ((parser-check ps 'LBRACKET)
-            (parser-advance! ps)
-            (let ((subscripts (parse-expression-list ps)))
-              (parser-expect! ps 'RBRACKET)
-              (make-awk-expr-array-ref name subscripts)))
+           ;; Array ref: NAME[
+           ((check? ps 'LBRACKET)
+            (advance! ps)
+            (let ((subs (parse-expr-list ps)))
+              (expect! ps 'RBRACKET)
+              (make-awk-expr-array-ref name subs)))
+           ;; Bare 'length' without parens = length($0)
+           ((eq? name 'length)
+            (make-awk-expr-call 'length '()))
            ;; Simple variable
-           (else
-            (make-awk-expr-var name #f)))))
-      
-      ;; getline
-      ((parser-check ps 'getline)
-       (parse-getline ps))
-      
+           (else (make-awk-expr-var name)))))
+      ((getline) (parse-getline-expr ps))
       (else
-       (error "unexpected token in expression" tok)))))
+       (error (string-append "unexpected token: " (symbol->string type)
+                             " at line " (number->string (tok-line (peek ps)))))))))
 
-(def (parse-subscript-rest ps)
-  "Parse rest of multi-dimensional subscript after first comma"
-  (let loop ((subscripts '()))
-    (parser-expect! ps 'COMMA)
-    (let ((expr (parse-expression ps)))
-      (if (parser-check ps 'COMMA)
-        (loop (cons expr subscripts))
-        (reverse (cons expr subscripts))))))
+(def (parse-expr-list ps)
+  (let loop ((exprs (list (parse-expr ps))))
+    (if (check? ps 'COMMA)
+      (begin (advance! ps) (skip-nl! ps) (loop (cons (parse-expr ps) exprs)))
+      (reverse exprs))))
 
-(def (parse-getline ps)
-  "Parse getline statement (7 forms)"
-  (parser-advance! ps)
-  (let ((var #f)
-        (file #f)
-        (command #f)
-        (coprocess? #f))
-    ;; Check for variable
-    (when (parser-check ps 'NAME)
-      (set! var (tok-value (parser-advance! ps))))
-    ;; Check for redirection
-    (cond
-      ((parser-check ps 'LT)
-       (parser-advance! ps)
-       (set! file (parse-expression ps)))
-      ((parser-check ps 'PIPE)
-       (parser-advance! ps)
-       (set! command (parse-expression ps)))
-      ((parser-check ps 'PIPEAMP)
-       (parser-advance! ps)
-       (set! command (parse-expression ps))
-       (set! coprocess? #t)))
-    (make-awk-expr-getline var file command coprocess?)))
+;;; Getline
 
-;;; Convenience function
-
-(def (parse-awk-string input)
-  "Parse AWK program from string"
-  (let ((ps (make-parser-from-string input)))
-    (parse-program ps)))
+(def (parse-getline-expr ps)
+  (advance! ps) ;; skip 'getline'
+  ;; getline [var] [< file]
+  (let ((var #f) (source #f) (cmd? #f))
+    (when (check? ps 'NAME)
+      (set! var (tok-value (advance! ps))))
+    (when (check? ps 'LT)
+      (advance! ps)
+      (set! source (parse-primary ps)))
+    (make-awk-expr-getline var source cmd?)))
